@@ -1,0 +1,192 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen,
+    Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+  background-color: #1a1a2e;
+  color: #eee;
+}
+
+#root {
+  width: 100vw;
+  height: 100vh;
+}
+
+.app-container {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+}
+
+.sidebar {
+  width: 360px;
+  background: #16213e;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  overflow-y: auto;
+}
+
+.sidebar h1 {
+  font-size: 1.4rem;
+  color: #4ecca3;
+  margin-bottom: 8px;
+}
+
+.sidebar h2 {
+  font-size: 1rem;
+  color: #888;
+  font-weight: 500;
+  margin-top: 12px;
+}
+
+.map-container {
+  flex: 1;
+  position: relative;
+}
+
+.control-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.control-group label {
+  font-size: 0.85rem;
+  color: #aaa;
+}
+
+.control-group input[type="range"] {
+  width: 100%;
+  accent-color: #4ecca3;
+}
+
+.control-group .value {
+  font-size: 0.9rem;
+  color: #4ecca3;
+  font-weight: 600;
+}
+
+.coordinates {
+  background: #0f3460;
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.coordinates p {
+  font-size: 0.85rem;
+  margin: 4px 0;
+}
+
+.coordinates .label {
+  color: #888;
+}
+
+.coordinates .coord {
+  color: #4ecca3;
+  font-family: monospace;
+}
+
+button.generate-btn {
+  background: #4ecca3;
+  color: #16213e;
+  border: none;
+  padding: 14px 20px;
+  font-size: 1rem;
+  font-weight: 600;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+  margin-top: 8px;
+}
+
+button.generate-btn:hover:not(:disabled) {
+  background: #3db892;
+  transform: translateY(-1px);
+}
+
+button.generate-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.stats-panel {
+  background: #0f3460;
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.stats-panel h3 {
+  font-size: 0.9rem;
+  color: #888;
+  margin-bottom: 8px;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.stat-item {
+  display: flex;
+  flex-direction: column;
+}
+
+.stat-item .stat-label {
+  font-size: 0.75rem;
+  color: #666;
+}
+
+.stat-item .stat-value {
+  font-size: 1rem;
+  color: #4ecca3;
+  font-weight: 600;
+}
+
+.error-message {
+  background: #e74c3c22;
+  border: 1px solid #e74c3c;
+  border-radius: 8px;
+  padding: 12px;
+  color: #e74c3c;
+  font-size: 0.9rem;
+}
+
+.info-text {
+  font-size: 0.8rem;
+  color: #666;
+  line-height: 1.4;
+}
+
+.elevation-chart {
+  background: #0f3460;
+  border-radius: 8px;
+  padding: 12px;
+  margin-top: 8px;
+}
+
+.elevation-chart h3 {
+  font-size: 0.9rem;
+  color: #888;
+  margin-bottom: 8px;
+}
+
+/* Leaflet overrides for dark theme */
+.leaflet-container {
+  background: #1a1a2e;
+}
+
+.leaflet-popup-content-wrapper {
+  background: #16213e;
+  color: #eee;
+}
+
+.leaflet-popup-tip {
+  background: #16213e;
+}
