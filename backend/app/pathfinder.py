@@ -53,7 +53,13 @@ class PathfindingConfig:
     # Cost weights
     distance_weight: float = 1.0
     elevation_change_weight: float = 1.5  # Penalty for climbing (reduced from 2.0)
-    curvature_weight: float = 0.3  # Penalty for turning (reduced from 0.5)
+    curvature_weight: float = 0.3  # Base penalty for turning
+    
+    # Curvature cost scaling - makes sharper turns progressively more expensive
+    # This encourages larger radii even when smaller ones are allowed
+    curvature_exponential: float = 2.0  # Exponent for curvature penalty (higher = prefer gentler curves)
+    heading_consistency_bonus: float = 0.1  # Bonus per step for maintaining same heading
+    max_consistency_bonus_steps: int = 10  # Max steps to accumulate consistency bonus
     
     # Soft constraint settings - allow slightly exceeding slope with heavy penalty
     hard_slope_limit_percent: float = 8.0  # Absolute maximum, never exceed
@@ -61,8 +67,8 @@ class PathfindingConfig:
     
     # Water avoidance
     water_penalty: float = 10000.0  # Very high cost to cross water
-    water_elevation_threshold: float = 5.0  # Cells at or below this are suspicious
-    water_flatness_threshold: float = 0.5  # Max elevation variance for water detection
+    water_elevation_threshold: float = 1.0  # Cells at or below this are suspicious (sea level is ~0m)
+    water_flatness_threshold: float = 0.1  # Max elevation variance for water detection (water is VERY flat)
     
     # Search settings
     allow_steep_fallback: bool = True  # If no path found, try with relaxed constraints
@@ -76,6 +82,13 @@ class PathfindingConfig:
     auto_tunnel_bridge: bool = False  # Enable automatic tunnel/bridge detection
     max_jump_distance_m: float = 500.0  # Maximum distance to search for similar elevation
     elevation_tolerance_m: float = 10.0  # Max elevation difference for auto-detection
+    
+    # Road parallelism constraints
+    road_parallel_enabled: bool = False  # Enable road parallel constraints
+    road_parallel_threshold_deg: float = 30.0  # Angle threshold for "nearly parallel" (within this of road direction)
+    road_min_separation_m: float = 10.0  # Minimum separation from road when parallel
+    road_max_separation_m: float = 50.0  # Maximum separation to apply parallel constraint
+    road_parallel_penalty: float = 500.0  # Penalty for violating parallel/separation constraint
     
     def max_heading_change(self) -> int:
         """
@@ -142,7 +155,10 @@ class ConstrainedAStar:
         elevation_grid: np.ndarray,
         bounds: Tuple[float, float, float, float],  # (min_lat, min_lng, max_lat, max_lng)
         transform: Dict[str, float],  # Grid transform parameters
-        config: PathfindingConfig
+        config: PathfindingConfig,
+        road_mask: Optional[np.ndarray] = None,
+        road_direction: Optional[np.ndarray] = None,
+        road_distance: Optional[np.ndarray] = None
     ):
         self.elevation = elevation_grid
         self.bounds = bounds
@@ -158,6 +174,14 @@ class ConstrainedAStar:
         water_cells = np.sum(self.water_mask)
         if water_cells > 0:
             print(f"[Pathfinder] Detected {water_cells} water cells ({100*water_cells/(self.rows*self.cols):.1f}% of grid)")
+        
+        # Road data (optional)
+        self.road_mask = road_mask if road_mask is not None else np.zeros((self.rows, self.cols), dtype=bool)
+        self.road_direction = road_direction if road_direction is not None else np.full((self.rows, self.cols), np.nan, dtype=np.float32)
+        self.road_distance = road_distance if road_distance is not None else np.full((self.rows, self.cols), np.inf, dtype=np.float32)
+        
+        if road_mask is not None and np.any(road_mask):
+            print(f"[Pathfinder] Road data loaded: {np.sum(road_mask)} road cells")
         
         # Tunnel and bridge zone masks
         # Manual masks are for user-defined tunnel/bridge zones
@@ -345,43 +369,83 @@ class ConstrainedAStar:
     def _detect_water_bodies(self) -> np.ndarray:
         """
         Detect water bodies based on elevation patterns.
-        Water appears as large flat areas at low elevation.
+        Water appears as large flat areas at or below sea level.
+        
+        Key insight: Real water bodies are EXTREMELY flat (variance near 0) and
+        at consistent elevation (typically 0m for sea, or a specific level for lakes).
+        Coastal plains and beaches have more variance and slight elevation gradients.
         
         Returns a boolean mask where True = water (avoid)
         """
         try:
-            # Criterion 1: Low elevation (at or near sea level)
-            low_elevation = self.elevation <= self.config.water_elevation_threshold
+            print(f"[Water Detection] Analyzing elevation grid (range: {self.elevation.min():.1f}m to {self.elevation.max():.1f}m)")
             
-            # Criterion 2: Very flat areas (low local variance)
-            # Use a local variance filter
+            # Criterion 1: Very low elevation (at or near sea level)
+            # Mapbox typically returns ~0m or slightly negative for sea
+            very_low = self.elevation <= 0.5  # Sea level with small buffer
+            low_elevation = self.elevation <= self.config.water_elevation_threshold  # User-configurable
+            
+            # Criterion 2: EXTREMELY flat areas (near-zero local variance)
             window_size = max(3, min(11, self.rows // 20, self.cols // 20))
             if window_size % 2 == 0:
                 window_size += 1
             
-            # Calculate local variance using uniform filter
             mean = uniform_filter(self.elevation.astype(np.float64), size=window_size)
             mean_sq = uniform_filter((self.elevation.astype(np.float64))**2, size=window_size)
             variance = mean_sq - mean**2
-            variance = np.maximum(variance, 0)  # Numerical stability
+            variance = np.maximum(variance, 0)
             
             flat_areas = variance < self.config.water_flatness_threshold
             
-            # Water = low AND flat
-            potential_water = low_elevation & flat_areas
+            # Criterion 3: Near-zero gradient
+            grad_row = np.gradient(self.elevation, axis=0)
+            grad_col = np.gradient(self.elevation, axis=1)
+            gradient_magnitude = np.sqrt(grad_row**2 + grad_col**2)
+            zero_gradient = gradient_magnitude < 0.1
             
-            # Criterion 3: Must be part of a large connected region
-            # Small flat areas might be valleys, not water
+            # Use a more aggressive detection: 
+            # Option A: At or below sea level (<=0m) - DEFINITELY water, no other criteria needed
+            # Option B: Very low elevation (<=0.5m) AND flat - almost certainly water
+            # Option C: Low elevation + flat + zero gradient - likely water
+            definite_water = self.elevation <= 0.0  # Sea level or below = water
+            certain_water = very_low & flat_areas  # Very low AND flat
+            likely_water = low_elevation & flat_areas & zero_gradient  # All criteria
+            
+            potential_water = definite_water | certain_water | likely_water
+            
+            # Criterion 4: Must be part of a reasonably large connected region
             labeled, num_features = label(potential_water)
             min_water_size = max(50, (self.rows * self.cols) // 200)  # At least 0.5% of grid or 50 cells
             
             water_mask = np.zeros_like(potential_water)
             for i in range(1, num_features + 1):
-                region_size = np.sum(labeled == i)
+                region = labeled == i
+                region_size = np.sum(region)
                 if region_size >= min_water_size:
-                    water_mask[labeled == i] = True
+                    # Additional check: consistent elevation (std < 1.0m for water)
+                    region_elevations = self.elevation[region]
+                    region_std = np.std(region_elevations)
+                    if region_std < 1.0:
+                        water_mask[region] = True
             
-            return water_mask
+            # Add a buffer zone around water bodies to prevent coastal edge-hugging
+            # Also mark low-elevation cells adjacent to water as water
+            from scipy.ndimage import binary_dilation
+            
+            # Dilate water mask by 2 cells to create buffer
+            structure = np.ones((3, 3), dtype=bool)  # 3x3 kernel for dilation
+            water_buffer = binary_dilation(water_mask, structure=structure, iterations=2)
+            
+            # Only apply buffer to low-elevation cells (< 3m) to avoid marking hills as water
+            low_elev_buffer = (water_buffer & (self.elevation < 3.0))
+            
+            # Combine original water with low-elevation buffer
+            final_water_mask = water_mask | low_elev_buffer
+            
+            buffer_added = np.sum(final_water_mask) - np.sum(water_mask)
+            print(f"[Water Detection] Added {buffer_added} buffer cells around water bodies")
+            
+            return final_water_mask
             
         except Exception as e:
             print(f"[Pathfinder] Water detection failed: {e}, disabling water avoidance")
@@ -405,8 +469,8 @@ class ConstrainedAStar:
         
         return row, col
     
-    def grid_to_latlon(self, row: int, col: int) -> Tuple[float, float]:
-        """Convert grid coordinates to lat/lon"""
+    def grid_to_latlon(self, row: float, col: float) -> Tuple[float, float]:
+        """Convert grid coordinates (int or float) to lat/lon"""
         min_lat, min_lng, max_lat, max_lng = self.bounds
         
         norm_row = row / (self.rows - 1) if self.rows > 1 else 0.5
@@ -422,6 +486,35 @@ class ConstrainedAStar:
         if 0 <= row < self.rows and 0 <= col < self.cols:
             return float(self.elevation[row, col])
         return float('inf')  # Out of bounds
+    
+    def _interpolate_elevation(self, row: float, col: float) -> float:
+        """Get interpolated elevation at float grid position using bilinear interpolation"""
+        row_int = int(row)
+        col_int = int(col)
+        row_frac = row - row_int
+        col_frac = col - col_int
+        
+        # Handle edge cases
+        if row_int < 0 or col_int < 0:
+            return float('inf')
+        if row_int >= self.rows - 1 or col_int >= self.cols - 1:
+            # At or beyond edge, use nearest valid cell
+            r = min(max(0, int(round(row))), self.rows - 1)
+            c = min(max(0, int(round(col))), self.cols - 1)
+            return float(self.elevation[r, c])
+        
+        # Bilinear interpolation
+        e00 = float(self.elevation[row_int, col_int])
+        e01 = float(self.elevation[row_int, col_int + 1])
+        e10 = float(self.elevation[row_int + 1, col_int])
+        e11 = float(self.elevation[row_int + 1, col_int + 1])
+        
+        # Interpolate along columns first
+        e0 = e00 * (1 - col_frac) + e01 * col_frac
+        e1 = e10 * (1 - col_frac) + e11 * col_frac
+        
+        # Then interpolate along rows
+        return e0 * (1 - row_frac) + e1 * row_frac
     
     def calculate_slope(self, from_row: int, from_col: int, to_row: int, to_col: int) -> float:
         """Calculate slope percentage between two grid cells"""
@@ -504,10 +597,29 @@ class ConstrainedAStar:
             distance = math.sqrt(d_row**2 + d_col**2) * self.config.cell_size_m
             elevation_change = abs(self.get_elevation(new_row, new_col) - self.get_elevation(state.row, state.col))
             
+            # Progressive curvature cost: exponential penalty for sharper turns
+            # heading_diff: 0=straight, 1=45°, 2=90°, 3=135°, 4=180°
+            # Use exponential scaling so slight curves are cheap, sharp curves are expensive
+            if heading_diff == 0:
+                curvature_cost = 0.0
+                # Heading consistency bonus: reward going straight
+                # Accumulates up to max_consistency_bonus_steps
+                consistency_steps = min(state.steps_in_segment, self.config.max_consistency_bonus_steps)
+                heading_consistency_bonus = -self.config.heading_consistency_bonus * distance * (1 + consistency_steps * 0.1)
+            else:
+                # Exponential curvature cost: penalty grows rapidly with sharpness
+                # cost = base * (exponent^heading_diff - 1) 
+                # With exponent=2: 0->0, 1->1, 2->3, 3->7, 4->15
+                curvature_cost = self.config.curvature_weight * distance * (
+                    self.config.curvature_exponential ** heading_diff - 1.0
+                ) * 2.0
+                heading_consistency_bonus = 0.0
+            
             cost = (
                 self.config.distance_weight * distance +
                 self.config.elevation_change_weight * elevation_change +
-                self.config.curvature_weight * heading_diff * 10  # Turning penalty
+                curvature_cost +
+                heading_consistency_bonus
             )
             
             # Add tunnel construction cost (tunnels are expensive!)
@@ -581,6 +693,53 @@ class ConstrainedAStar:
                 new_initial = initial_heading
                 new_steps = steps_in_segment + 1
             
+            # Road parallelism constraint
+            # If enabled and we're near a road and nearly parallel, enforce constraints
+            if self.config.road_parallel_enabled:
+                road_dist = self.road_distance[new_row, new_col]
+                road_dir = self.road_direction[new_row, new_col]
+                
+                # Check if we're within the influence zone of a road
+                if road_dist <= self.config.road_max_separation_m and not np.isnan(road_dir):
+                    # Convert heading to radians for comparison
+                    # Heading: N=0, NE=1, E=2, SE=3, S=4, SW=5, W=6, NW=7
+                    # Each step is 45 degrees, measured clockwise from North
+                    path_direction_rad = (int(new_heading) * 45) * (math.pi / 180)
+                    
+                    # Calculate angle difference (considering both directions as parallel)
+                    angle_diff = abs(path_direction_rad - road_dir)
+                    angle_diff = angle_diff % (2 * math.pi)
+                    if angle_diff > math.pi:
+                        angle_diff = 2 * math.pi - angle_diff
+                    # Also check anti-parallel (opposite direction is still parallel for a road)
+                    anti_parallel_diff = abs(angle_diff - math.pi)
+                    
+                    min_angle_diff = min(angle_diff, anti_parallel_diff)
+                    threshold_rad = self.config.road_parallel_threshold_deg * (math.pi / 180)
+                    
+                    is_nearly_parallel = min_angle_diff <= threshold_rad
+                    
+                    if is_nearly_parallel:
+                        # We're nearly parallel to the road
+                        # Check separation constraint
+                        if road_dist < self.config.road_min_separation_m:
+                            # Too close to the road - add heavy penalty or skip
+                            cost += self.config.road_parallel_penalty * 2
+                        elif road_dist > self.config.road_max_separation_m:
+                            # Too far from road when parallel - small penalty
+                            cost += self.config.road_parallel_penalty * 0.5
+                        
+                        # Bonus: If at ideal separation and parallel, reduce cost slightly
+                        # This encourages the path to stay parallel at proper distance
+                        ideal_separation = (self.config.road_min_separation_m + self.config.road_max_separation_m) / 2
+                        if abs(road_dist - ideal_separation) < 10:
+                            cost -= self.config.road_parallel_penalty * 0.3
+                    else:
+                        # Not parallel but near road
+                        # If within min separation and not parallel, that's worse
+                        if road_dist < self.config.road_min_separation_m:
+                            cost += self.config.road_parallel_penalty
+            
             new_state = State(new_row, new_col, new_heading, new_initial, new_steps)
             neighbors.append((new_state, cost))
         
@@ -648,13 +807,21 @@ class ConstrainedAStar:
     def find_path(
         self,
         start: Tuple[int, int],
-        goal: Tuple[int, int]
+        goal: Tuple[int, int],
+        start_heading: Optional[Heading] = None,
+        goal_heading: Optional[Heading] = None
     ) -> Tuple[Optional[List[Tuple[int, int]]], Dict[str, Any]]:
         """
         Find a path from start to goal using constrained A*.
         
         Uses soft slope constraints: prefers staying under max_slope_percent
         but allows up to hard_slope_limit_percent with heavy penalty.
+        
+        Args:
+            start: Starting position (row, col)
+            goal: Goal position (row, col)
+            start_heading: Optional fixed heading at start point (e.g., from previous waypoint)
+            goal_heading: Optional required heading at goal point (e.g., toward next waypoint)
         
         Returns:
             path: List of (row, col) tuples, or None if no path found
@@ -665,6 +832,10 @@ class ConstrainedAStar:
         
         print(f"[Pathfinder] Grid size: {self.rows}x{self.cols}")
         print(f"[Pathfinder] Start: ({start_row}, {start_col}), Goal: ({goal_row}, {goal_col})")
+        if start_heading is not None:
+            print(f"[Pathfinder] Start heading constraint: {start_heading.name}")
+        if goal_heading is not None:
+            print(f"[Pathfinder] Goal heading constraint: {goal_heading.name}")
         print(f"[Pathfinder] Target slope: {self.config.max_slope_percent}%, Hard limit: {self.config.hard_slope_limit_percent}%")
         print(f"[Pathfinder] Min radius: {self.config.min_curve_radius_m}m")
         print(f"[Pathfinder] Max heading change per step: {self.max_heading_change} (of 8)")
@@ -693,7 +864,12 @@ class ConstrainedAStar:
             print(f"[Pathfinder] Direct distance is only {direct_dist/1000:.1f}km - route will need significant detours")
         
         # Try with soft constraints first (allow slight slope exceedance with penalty)
-        path, stats = self._run_astar(start_row, start_col, goal_row, goal_col, goal_elev, use_soft_slope=True)
+        path, stats = self._run_astar(
+            start_row, start_col, goal_row, goal_col, goal_elev,
+            use_soft_slope=True,
+            start_heading=start_heading,
+            goal_heading=goal_heading
+        )
         
         if path is not None:
             # Check if the path exceeds the soft limit
@@ -710,22 +886,30 @@ class ConstrainedAStar:
         start_row: int, start_col: int,
         goal_row: int, goal_col: int,
         goal_elev: float,
-        use_soft_slope: bool = True
+        use_soft_slope: bool = True,
+        start_heading: Optional[Heading] = None,
+        goal_heading: Optional[Heading] = None
     ) -> Tuple[Optional[List[Tuple[int, int]]], Dict[str, Any]]:
         """
         Internal A* implementation.
         
         Args:
             use_soft_slope: If True, use soft slope constraints with penalties
+            start_heading: Optional constrained heading at start
+            goal_heading: Optional required heading at goal
         """
-        # Initialize search with ALL possible starting headings
+        # Initialize search with starting headings
+        # If start_heading is specified, only use that heading
+        # Otherwise, try ALL possible starting headings
         counter = 0
         open_set = []
         came_from: Dict[State, State] = {}
         g_score: Dict[State, float] = {}
         in_open: Set[State] = set()  # Track what's in open set for faster lookup
         
-        for heading in Heading:
+        start_headings = [start_heading] if start_heading is not None else list(Heading)
+        
+        for heading in start_headings:
             start_state = State(start_row, start_col, heading, heading, 0)  # initial_heading=heading, steps=0
             g_score[start_state] = 0
             h = self.heuristic(start_state, goal_row, goal_col, goal_elev)
@@ -746,10 +930,16 @@ class ConstrainedAStar:
             closed_set.add(current)
             nodes_expanded += 1
             
-            # Check if we've reached the goal (any heading)
-            if current.row == goal_row and current.col == goal_col:
+            # Check if we've reached the goal
+            # If goal_heading is specified, we must match that heading
+            at_goal = current.row == goal_row and current.col == goal_col
+            heading_ok = (goal_heading is None) or (current.heading == goal_heading)
+            
+            if at_goal and heading_ok:
                 # Reconstruct path
                 path = self._reconstruct_path(came_from, current)
+                water_crossings = self._count_water_crossings(path)
+                
                 stats = {
                     "nodes_expanded": nodes_expanded,
                     "max_queue_size": max_queue_size,
@@ -757,9 +947,9 @@ class ConstrainedAStar:
                     "total_distance_m": self._calculate_path_distance(path),
                     "max_slope_encountered": self._calculate_max_slope(path),
                     "elevation_gain_m": self._calculate_elevation_gain(path),
-                    "water_crossings": self._count_water_crossings(path),
+                    "water_crossings": water_crossings,
                 }
-                print(f"[Pathfinder] Path found! {nodes_expanded} nodes expanded, {len(path)} waypoints")
+                print(f"[Pathfinder] Path found! {nodes_expanded} nodes, {len(path)} waypoints, {water_crossings} water crossings")
                 return path, stats
             
             # Expand neighbors
@@ -905,8 +1095,22 @@ class ConstrainedAStar:
                 gain += elev_change
         return gain
     
-    def path_to_geojson(self, path: List[Tuple[int, int]], smooth: bool = True) -> dict:
-        """Convert a grid path to GeoJSON LineString with elevation data"""
+    def path_to_geojson(
+        self, 
+        path: List[Tuple[int, int]], 
+        smooth: bool = True,
+        smoothed_path: Optional[List[Tuple[float, float]]] = None,
+        original_nodes: Optional[List[Tuple[int, int]]] = None
+    ) -> dict:
+        """
+        Convert a grid path to GeoJSON LineString with elevation data.
+        
+        Args:
+            path: Original grid path (row, col tuples)
+            smooth: Whether to apply Douglas-Peucker smoothing
+            smoothed_path: Pre-smoothed path with float coordinates (from spline)
+            original_nodes: Original grid nodes for shadow visualization
+        """
         coordinates = []
         elevations = []
         structure_types = []  # Track if each segment is normal, tunnel, or bridge
@@ -915,28 +1119,26 @@ class ConstrainedAStar:
         auto_tunnels = []
         auto_bridges = []
         
+        # If we have a pre-smoothed path, use it for coordinates
+        # but still detect tunnels/bridges from original grid path
+        use_smoothed = smoothed_path is not None and len(smoothed_path) > 0
+        
+        # First, detect tunnels/bridges from original path
         for i, (row, col) in enumerate(path):
-            lat, lng = self.grid_to_latlon(row, col)
-            elev = self.get_elevation(row, col)
-            coordinates.append([lng, lat, elev])  # GeoJSON uses [lng, lat]
-            elevations.append(elev)
-            
-            # Check if this is a jump from the previous point (distance > sqrt(2) cells)
             if i > 0:
                 prev_row, prev_col = path[i-1]
                 dist = math.sqrt((row - prev_row)**2 + (col - prev_col)**2)
                 
                 if dist > 1.5:  # More than adjacent cell = jump
-                    # This is a tunnel or bridge segment
                     prev_lat, prev_lng = self.grid_to_latlon(prev_row, prev_col)
                     prev_elev = self.get_elevation(prev_row, prev_col)
+                    lat, lng = self.grid_to_latlon(row, col)
+                    elev = self.get_elevation(row, col)
                     
-                    # Determine if tunnel or bridge based on terrain between
                     is_water = False
                     max_elev_between = elev
                     min_elev_between = elev
                     
-                    # Sample points between
                     steps = int(dist)
                     for t in range(1, steps):
                         frac = t / steps
@@ -949,34 +1151,88 @@ class ConstrainedAStar:
                             max_elev_between = max(max_elev_between, check_elev)
                             min_elev_between = min(min_elev_between, check_elev)
                     
-                    segment = {
-                        "start": [prev_lng, prev_lat],
-                        "end": [lng, lat]
-                    }
+                    segment = {"start": [prev_lng, prev_lat], "end": [lng, lat]}
                     
                     if is_water or min_elev_between < min(prev_elev, elev) - 5:
                         auto_bridges.append(segment)
-                        structure_types.append("bridge")
                     else:
                         auto_tunnels.append(segment)
+        
+        # Now generate coordinates from smoothed path or original
+        if use_smoothed:
+            for row_f, col_f in smoothed_path:
+                # Interpolate position and elevation for float coordinates
+                row_int = int(row_f)
+                col_int = int(col_f)
+                row_frac = row_f - row_int
+                col_frac = col_f - col_int
+                
+                # Bilinear interpolation for position
+                lat, lng = self.grid_to_latlon(row_f, col_f)  # Will use float version
+                
+                # Bilinear interpolation for elevation
+                elev = self._interpolate_elevation(row_f, col_f)
+                
+                coordinates.append([lng, lat, elev])
+                elevations.append(elev)
+                
+                # Determine structure type (simplified for smoothed path)
+                row_check = int(round(row_f))
+                col_check = int(round(col_f))
+                if 0 <= row_check < self.rows and 0 <= col_check < self.cols:
+                    if self.is_manual_tunnel_zone(row_check, col_check):
                         structure_types.append("tunnel")
+                    elif self.is_manual_bridge_zone(row_check, col_check):
+                        structure_types.append("bridge")
+                    else:
+                        structure_types.append("normal")
                 else:
-                    # Normal adjacent move - check manual zones
-                    if self.is_manual_tunnel_zone(row, col):
+                    structure_types.append("normal")
+        else:
+            # Use original grid path
+            for i, (row, col) in enumerate(path):
+                lat, lng = self.grid_to_latlon(row, col)
+                elev = self.get_elevation(row, col)
+                coordinates.append([lng, lat, elev])
+                elevations.append(elev)
+                
+                if i > 0:
+                    prev_row, prev_col = path[i-1]
+                    dist = math.sqrt((row - prev_row)**2 + (col - prev_col)**2)
+                    
+                    if dist > 1.5:
+                        structure_types.append("bridge" if any(
+                            b["end"] == [lng, lat] for b in auto_bridges
+                        ) else "tunnel")
+                    elif self.is_manual_tunnel_zone(row, col):
                         structure_types.append("tunnel")
                     elif self.is_manual_bridge_zone(row, col):
                         structure_types.append("bridge")
                     else:
                         structure_types.append("normal")
-            else:
-                structure_types.append("normal")
+                else:
+                    structure_types.append("normal")
         
-        # Apply smoothing with minimum curve radius constraint
-        distances = []  # Cumulative distance along path in meters
-        if smooth and len(coordinates) > 3:
+        # Generate original nodes info for shadow visualization
+        grid_nodes = []
+        if original_nodes:
+            for row, col in original_nodes:
+                lat, lng = self.grid_to_latlon(row, col)
+                elev = self.get_elevation(row, col)
+                grid_nodes.append({
+                    "lat": lat,
+                    "lng": lng,
+                    "elevation": round(elev, 1),
+                    "row": row,
+                    "col": col
+                })
+        
+        # Apply Douglas-Peucker smoothing if requested and not using pre-smoothed
+        distances = []
+        if smooth and len(coordinates) > 3 and not use_smoothed:
             coordinates, elevations, distances = self._smooth_path(coordinates, elevations)
         else:
-            # Calculate distances for unsmoothed path
+            # Calculate distances for path
             distances = [0.0]
             for i in range(1, len(coordinates)):
                 d = self._haversine_distance(
@@ -999,16 +1255,17 @@ class ConstrainedAStar:
             "type": "Feature",
             "properties": {
                 "elevations": elevations,
-                "elevation_profile": elevation_profile,  # New: includes distance and position
-                "distances": distances,  # Cumulative distances in meters
+                "elevation_profile": elevation_profile,
+                "distances": distances,
                 "total_distance_m": distances[-1] if distances else 0,
                 "waypoint_count": len(coordinates),
                 "original_waypoints": len(path),
-                "smoothed": smooth,
+                "smoothed": smooth or use_smoothed,
                 "min_curve_radius_m": self.config.min_curve_radius_m,
                 "structure_types": structure_types,
                 "auto_tunnels": auto_tunnels,
-                "auto_bridges": auto_bridges
+                "auto_bridges": auto_bridges,
+                "grid_nodes": grid_nodes  # New: for shadow visualization
             },
             "geometry": {
                 "type": "LineString",
@@ -1424,3 +1681,232 @@ class ConstrainedAStar:
         denominator = math.sqrt(line_len_sq)
         
         return numerator / denominator
+
+
+def heading_from_delta(d_row: int, d_col: int) -> Optional[Heading]:
+    """Calculate heading from row/column delta."""
+    for heading, (dr, dc) in DIRECTION_VECTORS.items():
+        if dr == d_row and dc == d_col:
+            return heading
+    return None
+
+
+def heading_from_points(from_point: Tuple[float, float], to_point: Tuple[float, float]) -> Heading:
+    """
+    Calculate heading from one lat/lng point to another.
+    Returns the closest discrete heading.
+    """
+    lat1, lng1 = from_point
+    lat2, lng2 = to_point
+    
+    # Calculate bearing (angle from North, clockwise)
+    d_lat = lat2 - lat1
+    d_lng = lng2 - lng1
+    
+    # Bearing in radians
+    angle = math.atan2(d_lng, d_lat)  # Note: (d_lng, d_lat) for standard xy convention
+    angle_deg = math.degrees(angle)
+    
+    # Normalize to 0-360
+    if angle_deg < 0:
+        angle_deg += 360
+    
+    # Map to discrete heading (each is 45 degrees)
+    # N=0°, NE=45°, E=90°, SE=135°, S=180°, SW=225°, W=270°, NW=315°
+    heading_index = round(angle_deg / 45) % 8
+    return Heading(heading_index)
+
+
+def smooth_curves_post_process(
+    path: List[Tuple[int, int]],
+    elevation_grid: np.ndarray,
+    config: PathfindingConfig,
+    min_curve_radius_m: float
+) -> Tuple[List[Tuple[float, float]], List[Tuple[int, int]]]:
+    """
+    Post-process path to smooth curves using Catmull-Rom spline interpolation.
+    This creates smooth curves while staying close to the original path.
+    
+    Args:
+        path: Original path as list of (row, col) tuples (grid coordinates)
+        elevation_grid: The elevation grid for terrain checking
+        config: Pathfinding configuration
+        min_curve_radius_m: Minimum curve radius to enforce
+    
+    Returns:
+        Tuple of:
+        - Smoothed path with float coordinates (many interpolated points for smooth curves)
+        - Original grid nodes for shadow visualization
+    """
+    if len(path) < 3:
+        return [(float(p[0]), float(p[1])) for p in path], list(path)
+    
+    # Store original nodes for shadow visualization
+    original_nodes = list(path)
+    
+    # Convert all path points to float (keep ALL points as control points)
+    # This ensures we stay close to the original path
+    control_points = [(float(p[0]), float(p[1])) for p in path]
+    
+    # Apply Catmull-Rom spline interpolation with many intermediate points
+    # This creates smooth curves between ALL original points
+    smoothed = _catmull_rom_spline(control_points, segments_per_curve=8)
+    
+    return smoothed, original_nodes
+
+
+def _identify_control_points(path: List[Tuple[int, int]]) -> List[Tuple[float, float]]:
+    """
+    Identify key control points from path by detecting significant direction changes.
+    Returns float coordinates for smooth interpolation.
+    NOTE: This function is no longer used - we keep all points for better path fidelity.
+    """
+    if len(path) < 3:
+        return [(float(p[0]), float(p[1])) for p in path]
+    
+    control_points = [(float(path[0][0]), float(path[0][1]))]  # Always include start
+    
+    # Calculate cumulative direction changes
+    i = 1
+    last_added_idx = 0
+    
+    while i < len(path) - 1:
+        # Look at local curvature over a window
+        window_size = min(5, len(path) - i - 1, i)
+        if window_size < 1:
+            i += 1
+            continue
+        
+        # Vector from previous control point to current
+        prev_cp = control_points[-1]
+        curr = path[i]
+        
+        # Calculate direction change
+        if i >= 1 and i < len(path) - 1:
+            v1 = (curr[0] - path[i-1][0], curr[1] - path[i-1][1])
+            v2 = (path[i+1][0] - curr[0], path[i+1][1] - curr[1])
+            
+            # Cross product to detect turns
+            cross = v1[0] * v2[1] - v1[1] * v2[0]
+            dot = v1[0] * v2[0] + v1[1] * v2[1]
+            mag1 = math.sqrt(v1[0]**2 + v1[1]**2)
+            mag2 = math.sqrt(v2[0]**2 + v2[1]**2)
+            
+            if mag1 > 0 and mag2 > 0:
+                cos_angle = max(-1, min(1, dot / (mag1 * mag2)))
+                angle = math.degrees(math.acos(cos_angle))
+                
+                # Keep point if direction change > 15° or enough distance
+                distance_from_last = math.sqrt(
+                    (curr[0] - prev_cp[0])**2 + (curr[1] - prev_cp[1])**2
+                )
+                
+                if angle > 15 or distance_from_last > 5:
+                    # Use EXACT position, no averaging (to stay on valid terrain)
+                    control_points.append((float(curr[0]), float(curr[1])))
+                    last_added_idx = i
+        
+        i += 1
+    
+    # Always include end point
+    control_points.append((float(path[-1][0]), float(path[-1][1])))
+    
+    return control_points
+
+
+def _catmull_rom_spline(
+    control_points: List[Tuple[float, float]],
+    segments_per_curve: int = 5,
+    alpha: float = 0.5  # Centripetal Catmull-Rom (0.5 avoids cusps)
+) -> List[Tuple[float, float]]:
+    """
+    Generate smooth curve using Catmull-Rom spline interpolation.
+    
+    Args:
+        control_points: List of control points
+        segments_per_curve: Number of interpolated points between each control point pair
+        alpha: Parameterization (0=uniform, 0.5=centripetal, 1=chordal)
+    
+    Returns:
+        Smoothed path with interpolated points
+    """
+    if len(control_points) < 4:
+        return control_points
+    
+    result = []
+    
+    # Add phantom points at start and end for full curve coverage
+    p0 = (2 * control_points[0][0] - control_points[1][0],
+          2 * control_points[0][1] - control_points[1][1])
+    pn = (2 * control_points[-1][0] - control_points[-2][0],
+          2 * control_points[-1][1] - control_points[-2][1])
+    
+    extended_points = [p0] + control_points + [pn]
+    
+    for i in range(len(extended_points) - 3):
+        p0, p1, p2, p3 = extended_points[i:i+4]
+        
+        # Generate points along this segment
+        for j in range(segments_per_curve):
+            t = j / segments_per_curve
+            
+            # Catmull-Rom basis functions
+            t2 = t * t
+            t3 = t2 * t
+            
+            # Using standard Catmull-Rom matrix
+            b0 = -0.5*t3 + t2 - 0.5*t
+            b1 = 1.5*t3 - 2.5*t2 + 1.0
+            b2 = -1.5*t3 + 2.0*t2 + 0.5*t
+            b3 = 0.5*t3 - 0.5*t2
+            
+            x = b0*p0[0] + b1*p1[0] + b2*p2[0] + b3*p3[0]
+            y = b0*p0[1] + b1*p1[1] + b2*p2[1] + b3*p3[1]
+            
+            result.append((x, y))
+    
+    # Add the last control point
+    result.append(control_points[-1])
+    
+    return result
+
+
+def _remove_float_zigzags(path: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """
+    Remove zig-zag patterns from smoothed path.
+    """
+    if len(path) < 4:
+        return path
+    
+    result = [path[0]]
+    i = 1
+    
+    while i < len(path) - 1:
+        prev = result[-1]
+        curr = path[i]
+        next_pt = path[i + 1]
+        
+        # Calculate vectors
+        v1 = (curr[0] - prev[0], curr[1] - prev[1])
+        v2 = (next_pt[0] - curr[0], next_pt[1] - curr[1])
+        
+        # Check for sharp reversal (zig-zag)
+        dot = v1[0] * v2[0] + v1[1] * v2[1]
+        mag1 = math.sqrt(v1[0]**2 + v1[1]**2)
+        mag2 = math.sqrt(v2[0]**2 + v2[1]**2)
+        
+        if mag1 > 0.001 and mag2 > 0.001:
+            cos_angle = dot / (mag1 * mag2)
+            cos_angle = max(-1, min(1, cos_angle))
+            angle = math.degrees(math.acos(cos_angle))
+            
+            # Skip points that create very sharp angles (< 60 degrees = backtracking)
+            if angle < 60:
+                i += 1
+                continue
+        
+        result.append(curr)
+        i += 1
+    
+    result.append(path[-1])
+    return result

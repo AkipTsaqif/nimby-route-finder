@@ -19,6 +19,7 @@ import numpy as np
 
 from .pathfinder import ConstrainedAStar, PathfindingConfig
 from .elevation import ElevationService
+from .roads import RoadService
 
 app = FastAPI(
     title="NIMBY Route Finder",
@@ -37,6 +38,7 @@ app.add_middleware(
 
 # Services
 elevation_service = ElevationService()
+road_service = RoadService()
 
 
 class LatLng(BaseModel):
@@ -76,6 +78,11 @@ class RouteRequest(BaseModel):
     auto_tunnel_bridge: bool = False  # Enable automatic tunnel/bridge detection
     max_jump_distance_m: float = 500.0  # Maximum distance for auto tunnel/bridge
     elevation_tolerance_m: float = 10.0  # Elevation tolerance for auto detection
+    # Road parallelism constraints
+    road_parallel_enabled: bool = False  # Enable road parallel constraints
+    road_parallel_threshold_deg: float = 30.0  # Angle threshold for "nearly parallel"
+    road_min_separation_m: float = 10.0  # Minimum separation from road when parallel
+    road_max_separation_m: float = 50.0  # Maximum separation to apply parallel constraint
     # Waypoints, tunnels, bridges
     waypoints: List[LatLng] = []  # Intermediate points the route must pass through
     tunnels: List[TunnelPortal] = []  # Tunnel entry/exit pairs
@@ -151,10 +158,40 @@ async def generate_route(request: RouteRequest):
             auto_tunnel_bridge=request.auto_tunnel_bridge,
             max_jump_distance_m=request.max_jump_distance_m,
             elevation_tolerance_m=request.elevation_tolerance_m,
+            # Road parallelism constraints
+            road_parallel_enabled=request.road_parallel_enabled,
+            road_parallel_threshold_deg=request.road_parallel_threshold_deg,
+            road_min_separation_m=request.road_min_separation_m,
+            road_max_separation_m=request.road_max_separation_m,
         )
 
+        # Fetch road data if road parallel constraints are enabled
+        road_mask = None
+        road_direction = None
+        road_distance = None
+        
+        if request.road_parallel_enabled:
+            min_lat, min_lng, max_lat, max_lng = bounds
+            road_segments = await road_service.get_roads_in_bounds(
+                min_lat, min_lng, max_lat, max_lng
+            )
+            
+            if road_segments:
+                road_mask, road_direction, road_distance = road_service.rasterize_roads(
+                    road_segments,
+                    bounds,
+                    elevation_grid.shape[0],
+                    elevation_grid.shape[1],
+                    transform.get('cell_size_m', 30.0)
+                )
+
         # Create pathfinder
-        pathfinder = ConstrainedAStar(elevation_grid, bounds, transform, config)
+        pathfinder = ConstrainedAStar(
+            elevation_grid, bounds, transform, config,
+            road_mask=road_mask,
+            road_direction=road_direction,
+            road_distance=road_distance
+        )
         
         # Register tunnel zones (areas where slope constraints are relaxed)
         for tunnel in request.tunnels:
@@ -189,7 +226,12 @@ async def generate_route(request: RouteRequest):
             "segments": len(segment_points) - 1,
         }
         
-        # Find path for each segment
+        # Import heading helper
+        from .pathfinder import heading_from_points
+        
+        # Find path for each segment with direction constraints
+        last_heading = None  # Track heading from previous segment
+        
         for i in range(len(segment_points) - 1):
             start_pt = segment_points[i]
             end_pt = segment_points[i + 1]
@@ -197,16 +239,56 @@ async def generate_route(request: RouteRequest):
             start_grid = pathfinder.latlon_to_grid(start_pt[0], start_pt[1])
             end_grid = pathfinder.latlon_to_grid(end_pt[0], end_pt[1])
             
+            # Calculate direction constraints
+            # Start heading: use last_heading from previous segment (if any) for continuity
+            start_heading = last_heading
+            
+            # Goal heading: calculate direction toward next waypoint (if exists)
+            goal_heading = None
+            if i < len(segment_points) - 2:
+                # There's another segment after this one
+                next_pt = segment_points[i + 2]
+                # Calculate heading from current goal to next waypoint
+                goal_heading = heading_from_points(end_pt, next_pt)
+            
             print(f"[Route] Finding segment {i+1}/{len(segment_points)-1}: {start_pt} -> {end_pt}")
+            if start_heading:
+                print(f"[Route] Start heading constraint: {start_heading.name}")
+            if goal_heading:
+                print(f"[Route] Goal heading constraint: {goal_heading.name}")
             
-            path, stats = pathfinder.find_path(start_grid, end_grid)
+            path, stats = pathfinder.find_path(
+                start_grid, end_grid,
+                start_heading=start_heading,
+                goal_heading=goal_heading
+            )
             
+            if path is None:
+                # Retry without heading constraints if constrained search failed
+                print(f"[Route] Segment {i+1} failed with heading constraints, retrying without...")
+                path, stats = pathfinder.find_path(start_grid, end_grid)
+                
             if path is None:
                 return RouteResponse(
                     success=False,
                     message=f"No valid route found for segment {i+1} (waypoint {i} to {i+1}). Try adding tunnels or bridges, or relaxing constraints.",
                     stats=stats
                 )
+            
+            # Calculate exit heading from this segment for next segment
+            if len(path) >= 2:
+                # Get direction of last step in path
+                last_row, last_col = path[-1]
+                prev_row, prev_col = path[-2]
+                d_row = last_row - prev_row
+                d_col = last_col - prev_col
+                # Normalize to unit step
+                if d_row != 0:
+                    d_row = d_row // abs(d_row)
+                if d_col != 0:
+                    d_col = d_col // abs(d_col)
+                from .pathfinder import heading_from_delta
+                last_heading = heading_from_delta(d_row, d_col)
             
             # Append path (skip first point if not first segment to avoid duplicates)
             if i > 0 and full_path:
@@ -228,8 +310,27 @@ async def generate_route(request: RouteRequest):
             if "warning" in stats:
                 total_stats["warning"] = stats["warning"]
 
-        # Convert full path to GeoJSON
-        geojson = pathfinder.path_to_geojson(full_path)
+        # Apply curve smoothing post-processing to remove zig-zags
+        # This now returns (smoothed_float_path, original_nodes)
+        from .pathfinder import smooth_curves_post_process
+        original_length = len(full_path)
+        smoothed_path, original_nodes = smooth_curves_post_process(
+            full_path,
+            elevation_grid,
+            config,
+            config.min_curve_radius_m
+        )
+        if len(smoothed_path) != original_length:
+            print(f"[Route] Curve smoothing: {original_length} -> {len(smoothed_path)} points")
+            total_stats["path_length"] = len(smoothed_path)
+
+        # Convert to GeoJSON with smoothed coordinates and original node shadows
+        geojson = pathfinder.path_to_geojson(
+            full_path,  # Original grid path for tunnel/bridge detection
+            smooth=False,  # Don't apply Douglas-Peucker, we have spline-smoothed
+            smoothed_path=smoothed_path,  # Pre-smoothed float coordinates
+            original_nodes=original_nodes  # Original grid nodes for shadow visualization
+        )
         
         # Add tunnel and bridge info to GeoJSON properties
         geojson["properties"]["tunnels"] = [
@@ -246,7 +347,7 @@ async def generate_route(request: RouteRequest):
 
         return RouteResponse(
             success=True,
-            message=f"Route found with {len(full_path)} waypoints across {total_stats['segments']} segment(s)",
+            message=f"Route found with {len(smoothed_path)} waypoints across {total_stats['segments']} segment(s)",
             route_geojson=geojson,
             stats=total_stats
         )
