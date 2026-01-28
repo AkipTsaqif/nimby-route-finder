@@ -26,6 +26,7 @@ from .kinodynamic import (
 )
 from .elevation import ElevationService
 from .roads import RoadService
+from .water import create_water_mask_from_osm
 
 app = FastAPI(
     title="NIMBY Route Finder",
@@ -106,6 +107,7 @@ class RouteRequest(BaseModel):
     # Pathfinder selection
     use_kinodynamic: bool = True  # True = new kinodynamic A*, False = legacy grid A*
     max_iterations: int = 500000  # Maximum iterations for pathfinding (kinodynamic only)
+    bidirectional_search: bool = False  # Enable bidirectional A* search (kinodynamic only)
 
 
 class RouteResponse(BaseModel):
@@ -397,6 +399,8 @@ async def generate_route(request: RouteRequest):
             road_min_separation_m=request.road_min_separation_m,
             road_max_separation_m=request.road_max_separation_m,
             road_parallel_penalty=500.0,
+            # Bidirectional search
+            bidirectional_search=request.bidirectional_search,
         )
 
         # Create elevation grid wrapper for kinodynamic pathfinder
@@ -405,9 +409,29 @@ async def generate_route(request: RouteRequest):
             bounds=bounds
         )
         
-        # Create water mask from elevation data (low elevation areas)
-        water_threshold = 1.0  # meters
-        water_mask = elevation_grid < water_threshold
+        # Create water mask from OpenStreetMap data (actual water bodies)
+        # This is more accurate than elevation-based detection
+        print(f"[Kinodynamic] Fetching water body data from OpenStreetMap...")
+        water_mask, osm_success = create_water_mask_from_osm(
+            min_lat=min_lat, min_lon=min_lng,
+            max_lat=max_lat, max_lon=max_lng,
+            grid_rows=elevation_grid.shape[0],
+            grid_cols=elevation_grid.shape[1],
+            timeout=30.0
+        )
+        
+        if not osm_success:
+            # Fallback to elevation-based detection if OSM fails
+            print(f"[Kinodynamic] OSM water fetch failed, using elevation-based fallback")
+            water_threshold = 0.1  # meters
+            water_mask = elevation_grid < water_threshold
+            water_count = np.sum(water_mask)
+            water_pct = (water_count / water_mask.size) * 100
+            print(f"[Kinodynamic] Water mask (elevation): {water_count:,} cells ({water_pct:.1f}%) below {water_threshold}m")
+        else:
+            water_count = np.sum(water_mask)
+            water_pct = (water_count / water_mask.size) * 100
+            print(f"[Kinodynamic] Water mask (OSM): {water_count:,} cells ({water_pct:.1f}%)")
         
         # Create constraint masks
         constraints = ConstraintMasks(
@@ -501,6 +525,8 @@ async def generate_route(request: RouteRequest):
         
         print(f"[Kinodynamic] Finding path through {len(waypoints_local)} waypoints")
         print(f"[Kinodynamic] Path distance: {total_path_distance/1000:.1f}km, max iterations: {max_iters:,}")
+        if request.bidirectional_search:
+            print(f"[Kinodynamic] Bidirectional search ENABLED - searching from both ends")
         for i, (wx, wy) in enumerate(waypoints_local):
             heading_info = f", heading={headings_local[i]:.1f}°" if headings_local[i] is not None else ""
             print(f"[Kinodynamic] Waypoint {i}: ({wx:.1f}, {wy:.1f}){heading_info}")

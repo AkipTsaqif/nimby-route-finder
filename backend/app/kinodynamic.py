@@ -128,6 +128,9 @@ class KinodynamicConfig:
     # Relaxed goal tolerance (relative to step size)
     goal_tolerance_multiplier: float = 1.5  # goal_tolerance = step_size * this
     
+    # === Bidirectional Search ===
+    bidirectional_search: bool = False  # Search from both start and goal
+    
     # === Search Limits ===
     max_iterations: int = 5_000_000
     progress_interval: int = 100_000
@@ -2344,6 +2347,442 @@ class KinodynamicPathfinder:
             message=f"Path found through {len(waypoints)} waypoints in {total_iterations} iterations, {elapsed:.2f}s"
         )
     
+    def _find_path_segment_bidirectional(
+        self,
+        start_x: float, start_y: float,
+        goal_x: float, goal_y: float,
+        initial_heading: float,
+        initial_direction_gear: DirectionGear,
+        last_switchback_x: Optional[float],
+        last_switchback_y: Optional[float],
+        max_iterations: int,
+        goal_tolerance: float
+    ) -> PathResult:
+        """
+        Bidirectional A* search - searches from both start and goal simultaneously.
+        
+        When the two searches meet, we've found a path that goes around obstacles
+        that would otherwise cause one-sided search to get stuck.
+        """
+        start_time = time.time()
+        
+        # Convert heading to radians
+        heading_rad = math.radians(initial_heading)
+        
+        # Calculate goal heading (reverse direction - pointing back toward start)
+        dx = start_x - goal_x
+        dy = start_y - goal_y
+        goal_heading_rad = math.atan2(dx, dy)  # Heading from goal toward start
+        
+        # === FORWARD SEARCH (from start) ===
+        forward_start = State(
+            x=start_x, y=start_y,
+            heading=heading_rad,
+            direction_gear=initial_direction_gear,
+            last_switchback_x=last_switchback_x,
+            last_switchback_y=last_switchback_y
+        )
+        forward_open: List[Tuple[float, int, PathNode]] = []
+        forward_closed: Set[Tuple[int, int, int, int]] = set()
+        forward_best_g: Dict[Tuple[int, int, int, int], float] = {}
+        forward_nodes: Dict[Tuple[int, int, int, int], PathNode] = {}  # For reconstruction
+        
+        h_forward = self.heuristic(forward_start, goal_x, goal_y)
+        forward_node = PathNode(state=forward_start, g_cost=0.0, f_cost=h_forward)
+        heapq.heappush(forward_open, (forward_node.f_cost, 0, forward_node))
+        forward_counter = 1
+        
+        # === BACKWARD SEARCH (from goal) ===
+        backward_start = State(
+            x=goal_x, y=goal_y,
+            heading=goal_heading_rad,
+            direction_gear=initial_direction_gear,  # Same gear
+            last_switchback_x=None,
+            last_switchback_y=None
+        )
+        backward_open: List[Tuple[float, int, PathNode]] = []
+        backward_closed: Set[Tuple[int, int, int, int]] = set()
+        backward_best_g: Dict[Tuple[int, int, int, int], float] = {}
+        backward_nodes: Dict[Tuple[int, int, int, int], PathNode] = {}  # For reconstruction
+        
+        h_backward = self.heuristic(backward_start, start_x, start_y)
+        backward_node = PathNode(state=backward_start, g_cost=0.0, f_cost=h_backward)
+        heapq.heappush(backward_open, (backward_node.f_cost, 0, backward_node))
+        backward_counter = 1
+        
+        iterations = 0
+        nodes_expanded = 0
+        progress_interval = 10000
+        
+        initial_distance = math.sqrt((goal_x - start_x)**2 + (goal_y - start_y)**2)
+        best_forward_dist = initial_distance
+        best_backward_dist = initial_distance
+        
+        # Track best progress node (closest to goal) for partial path on failure
+        best_forward_progress_node: Optional[PathNode] = forward_node
+        best_forward_progress_dist: float = initial_distance
+        
+        # Meeting point tracking
+        best_meeting_cost = float('inf')
+        best_meeting_forward_node: Optional[PathNode] = None
+        best_meeting_backward_node: Optional[PathNode] = None
+        
+        # Spatial index for quick meeting point detection
+        # Uses coarser buckets than state discretization for meeting detection
+        meeting_bucket_size = self.config.step_distance_m * 2
+        
+        def position_bucket(x: float, y: float) -> Tuple[int, int]:
+            return (int(x / meeting_bucket_size), int(y / meeting_bucket_size))
+        
+        forward_positions: Dict[Tuple[int, int], List[PathNode]] = {}
+        backward_positions: Dict[Tuple[int, int], List[PathNode]] = {}
+        
+        # Track expansions for balanced alternation
+        forward_expansions = 0
+        backward_expansions = 0
+        
+        while (forward_open or backward_open) and iterations < max_iterations:
+            iterations += 1
+            
+            # BALANCED alternation: ensure both searches get fair iterations
+            # Use strict alternation, but skip if one search is empty
+            expand_forward = True
+            if forward_open and backward_open:
+                # Alternate strictly, but if one side is way behind, give it more turns
+                if forward_expansions > backward_expansions + 1000:
+                    expand_forward = False
+                elif backward_expansions > forward_expansions + 1000:
+                    expand_forward = True
+                else:
+                    # Strict alternation
+                    expand_forward = (iterations % 2 == 1)
+            elif backward_open:
+                expand_forward = False
+            elif forward_open:
+                expand_forward = True
+            else:
+                break  # Both queues empty
+            
+            if expand_forward:
+                if not forward_open:
+                    continue  # Skip this iteration, try backward next time
+                _, _, current = heapq.heappop(forward_open)
+                state_key = current.state._discretize()
+                
+                if state_key in forward_closed:
+                    continue  # Already expanded, skip
+                
+                forward_closed.add(state_key)
+                forward_nodes[state_key] = current
+                nodes_expanded += 1
+                forward_expansions += 1
+                
+                # Track position for meeting detection
+                pos_bucket = position_bucket(current.state.x, current.state.y)
+                if pos_bucket not in forward_positions:
+                    forward_positions[pos_bucket] = []
+                forward_positions[pos_bucket].append(current)
+                
+                # Check if we've reached the actual goal
+                if self.is_goal(current.state, goal_x, goal_y, goal_tolerance):
+                    path_segments = self._reconstruct_path(current)
+                    elapsed = time.time() - start_time
+                    return PathResult(
+                        success=True, path=path_segments,
+                        total_cost=current.g_cost, iterations=iterations,
+                        nodes_expanded=nodes_expanded, elapsed_time=elapsed,
+                        message=f"Segment found (forward reached goal) in {iterations} iterations"
+                    )
+                
+                # Check for meeting with backward search
+                for nearby_bucket in [pos_bucket, 
+                                      (pos_bucket[0]-1, pos_bucket[1]),
+                                      (pos_bucket[0]+1, pos_bucket[1]),
+                                      (pos_bucket[0], pos_bucket[1]-1),
+                                      (pos_bucket[0], pos_bucket[1]+1)]:
+                    if nearby_bucket in backward_positions:
+                        for back_node in backward_positions[nearby_bucket]:
+                            dist = math.sqrt(
+                                (current.state.x - back_node.state.x)**2 +
+                                (current.state.y - back_node.state.y)**2
+                            )
+                            if dist < goal_tolerance * 2:
+                                # Found a meeting point!
+                                meeting_cost = current.g_cost + back_node.g_cost + dist
+                                if meeting_cost < best_meeting_cost:
+                                    best_meeting_cost = meeting_cost
+                                    best_meeting_forward_node = current
+                                    best_meeting_backward_node = back_node
+                
+                # Update best forward distance and track best progress node
+                dist_to_goal = math.sqrt(
+                    (goal_x - current.state.x)**2 + (goal_y - current.state.y)**2
+                )
+                if dist_to_goal < best_forward_progress_dist:
+                    best_forward_progress_dist = dist_to_goal
+                    best_forward_progress_node = current
+                best_forward_dist = min(best_forward_dist, dist_to_goal)
+                
+                # Expand forward neighbors
+                neighbors = self.neighbor_generator.get_neighbors(
+                    current.state, goal_x, goal_y
+                )
+                for neighbor in neighbors:
+                    new_g = current.g_cost + neighbor.cost
+                    new_state_key = neighbor.state._discretize()
+                    
+                    if new_state_key in forward_closed:
+                        continue
+                    if new_state_key in forward_best_g and forward_best_g[new_state_key] <= new_g:
+                        continue
+                    
+                    forward_best_g[new_state_key] = new_g
+                    h = self.heuristic(neighbor.state, goal_x, goal_y)
+                    new_f = new_g + h
+                    
+                    new_node = PathNode(
+                        state=neighbor.state, g_cost=new_g, f_cost=new_f,
+                        parent=current, primitive=neighbor.primitive,
+                        structure_type=neighbor.structure_type,
+                        is_switchback=neighbor.is_switchback,
+                        is_portal=neighbor.is_portal,
+                        is_auto_structure=neighbor.is_auto_structure
+                    )
+                    heapq.heappush(forward_open, (new_f, forward_counter, new_node))
+                    forward_counter += 1
+            
+            else:  # Backward expansion
+                if not backward_open:
+                    continue  # Skip, try forward next time
+                _, _, current = heapq.heappop(backward_open)
+                state_key = current.state._discretize()
+                
+                if state_key in backward_closed:
+                    continue  # Already expanded, skip
+                
+                backward_closed.add(state_key)
+                backward_nodes[state_key] = current
+                nodes_expanded += 1
+                backward_expansions += 1
+                
+                # Track position for meeting detection
+                pos_bucket = position_bucket(current.state.x, current.state.y)
+                if pos_bucket not in backward_positions:
+                    backward_positions[pos_bucket] = []
+                backward_positions[pos_bucket].append(current)
+                
+                # Check if backward reached the start
+                if self.is_goal(current.state, start_x, start_y, goal_tolerance):
+                    # Reconstruct backward path and reverse it
+                    path_segments = self._reconstruct_path_reversed(current)
+                    elapsed = time.time() - start_time
+                    return PathResult(
+                        success=True, path=path_segments,
+                        total_cost=current.g_cost, iterations=iterations,
+                        nodes_expanded=nodes_expanded, elapsed_time=elapsed,
+                        message=f"Segment found (backward reached start) in {iterations} iterations"
+                    )
+                
+                # Check for meeting with forward search
+                for nearby_bucket in [pos_bucket,
+                                      (pos_bucket[0]-1, pos_bucket[1]),
+                                      (pos_bucket[0]+1, pos_bucket[1]),
+                                      (pos_bucket[0], pos_bucket[1]-1),
+                                      (pos_bucket[0], pos_bucket[1]+1)]:
+                    if nearby_bucket in forward_positions:
+                        for fwd_node in forward_positions[nearby_bucket]:
+                            dist = math.sqrt(
+                                (current.state.x - fwd_node.state.x)**2 +
+                                (current.state.y - fwd_node.state.y)**2
+                            )
+                            if dist < goal_tolerance * 2:
+                                meeting_cost = fwd_node.g_cost + current.g_cost + dist
+                                if meeting_cost < best_meeting_cost:
+                                    best_meeting_cost = meeting_cost
+                                    best_meeting_forward_node = fwd_node
+                                    best_meeting_backward_node = current
+                
+                # Update best backward distance
+                dist_to_start = math.sqrt(
+                    (start_x - current.state.x)**2 + (start_y - current.state.y)**2
+                )
+                best_backward_dist = min(best_backward_dist, dist_to_start)
+                
+                # Expand backward neighbors (toward start)
+                neighbors = self.neighbor_generator.get_neighbors(
+                    current.state, start_x, start_y
+                )
+                for neighbor in neighbors:
+                    new_g = current.g_cost + neighbor.cost
+                    new_state_key = neighbor.state._discretize()
+                    
+                    if new_state_key in backward_closed:
+                        continue
+                    if new_state_key in backward_best_g and backward_best_g[new_state_key] <= new_g:
+                        continue
+                    
+                    backward_best_g[new_state_key] = new_g
+                    h = self.heuristic(neighbor.state, start_x, start_y)
+                    new_f = new_g + h
+                    
+                    new_node = PathNode(
+                        state=neighbor.state, g_cost=new_g, f_cost=new_f,
+                        parent=current, primitive=neighbor.primitive,
+                        structure_type=neighbor.structure_type,
+                        is_switchback=neighbor.is_switchback,
+                        is_portal=neighbor.is_portal,
+                        is_auto_structure=neighbor.is_auto_structure
+                    )
+                    heapq.heappush(backward_open, (new_f, backward_counter, new_node))
+                    backward_counter += 1
+            
+            # Progress logging
+            if iterations % progress_interval == 0:
+                elapsed = time.time() - start_time
+                forward_progress = (1 - best_forward_dist / initial_distance) * 100
+                backward_progress = (1 - best_backward_dist / initial_distance) * 100
+                total_progress = forward_progress + backward_progress
+                
+                meeting_info = ""
+                if best_meeting_forward_node is not None:
+                    meeting_info = f", meeting found (cost={best_meeting_cost:.0f})"
+                
+                print(f"[Kinodynamic-Bidir] {iterations:,} iters, "
+                      f"fwd:{forward_expansions:,}exp/{len(forward_open):,}q/{forward_progress:.1f}%, "
+                      f"bwd:{backward_expansions:,}exp/{len(backward_open):,}q/{backward_progress:.1f}%, "
+                      f"{elapsed:.1f}s{meeting_info}")
+                
+                # Diagnostic: if forward search is stuck at 0%, log why
+                if forward_progress < 1.0 and iterations > 20000:
+                    if len(forward_open) <= 10:
+                        print(f"[Kinodynamic-Bidir] ⚠️ Forward search has only {len(forward_open)} nodes in queue!")
+                        print(f"[Kinodynamic-Bidir]    Forward expanded: {forward_expansions}, Backward expanded: {backward_expansions}")
+                        if forward_open:
+                            top_node = forward_open[0][2]
+                            print(f"[Kinodynamic-Bidir]    Top forward node: pos=({top_node.state.x:.0f},{top_node.state.y:.0f}), "
+                                  f"heading={math.degrees(top_node.state.heading):.1f}°, f={forward_open[0][0]:.0f}")
+                
+                # If we have a meeting and both searches are making no more progress, use it
+                if best_meeting_forward_node is not None:
+                    # Check if continuing search is unlikely to improve
+                    if forward_open and backward_open:
+                        fwd_best_f = forward_open[0][0]
+                        bwd_best_f = backward_open[0][0]
+                        # If best unexplored f-costs exceed our meeting cost, we're done
+                        if fwd_best_f + bwd_best_f > best_meeting_cost * 1.1:
+                            break
+        
+        elapsed = time.time() - start_time
+        
+        # Check if we found a meeting point
+        if best_meeting_forward_node is not None and best_meeting_backward_node is not None:
+            # Reconstruct path: forward path + reversed backward path
+            forward_path = self._reconstruct_path(best_meeting_forward_node)
+            backward_path = self._reconstruct_path_reversed(best_meeting_backward_node)
+            
+            # Combine paths (skip duplicate meeting point)
+            combined_path = forward_path + backward_path[1:] if backward_path else forward_path
+            
+            return PathResult(
+                success=True,
+                path=combined_path,
+                total_cost=best_meeting_cost,
+                iterations=iterations,
+                nodes_expanded=nodes_expanded,
+                elapsed_time=elapsed,
+                message=f"Segment found via bidirectional meeting in {iterations} iterations"
+            )
+        
+        # No path found - include partial path from best progress node
+        failure_x = start_x
+        failure_y = start_y
+        best_dist = initial_distance
+        partial_path: List[PathSegment] = []
+        
+        # Use best progress node for failure location and partial path
+        if best_forward_progress_node is not None:
+            failure_x = best_forward_progress_node.state.x
+            failure_y = best_forward_progress_node.state.y
+            best_dist = best_forward_progress_dist
+            # Reconstruct partial path to best progress point
+            partial_path = self._reconstruct_path(best_forward_progress_node)
+            print(f"[Kinodynamic-Bidir] Partial path: {len(partial_path)} segments to ({failure_x:.0f}, {failure_y:.0f})")
+        
+        if iterations >= max_iterations:
+            message = f"Bidirectional search: max iterations ({max_iterations}) reached"
+        else:
+            message = "Bidirectional search: no path exists"
+        
+        return PathResult(
+            success=False,
+            path=partial_path,  # Include partial path!
+            total_cost=float('inf'),
+            iterations=iterations,
+            nodes_expanded=nodes_expanded,
+            elapsed_time=elapsed,
+            message=message,
+            failure_x=failure_x,
+            failure_y=failure_y,
+            best_distance_remaining=best_dist
+        )
+    
+    def _reconstruct_path_reversed(self, goal_node: PathNode) -> List[PathSegment]:
+        """
+        Reconstruct path from a backward search node.
+        
+        Since backward search goes goal→start, we need to:
+        1. Collect nodes from the backward goal to backward start
+        2. Reverse to get start→goal order
+        3. Flip headings (add 180°) since backward search faces opposite direction
+        """
+        # Collect nodes
+        nodes: List[PathNode] = []
+        current = goal_node
+        while current is not None:
+            nodes.append(current)
+            current = current.parent
+        
+        # nodes is now [backward_leaf, ..., backward_root (at goal)]
+        # We want [goal, ..., backward_leaf] with flipped headings
+        # But since backward started at GOAL, we just reverse to get goal→leaf
+        # which is still backward. We need leaf→goal for the forward direction.
+        # Actually: nodes[0] = where backward search reached
+        #           nodes[-1] = goal (where backward started)
+        # For output path, we want: nodes[-1] → nodes[0], which is nodes reversed
+        # No wait, we DON'T reverse - the backward path goes from meeting point toward goal
+        
+        path_segments: List[PathSegment] = []
+        
+        # Don't reverse - nodes[0] is meeting point, nodes[-1] is goal
+        # We want meeting_point → goal, so iterate forward through nodes
+        for i, node in enumerate(nodes):
+            elev = self.elevation_grid.get_elevation(node.state.x, node.state.y)
+            if elev == float('inf'):
+                elev = 0.0
+            
+            # Flip heading by 180° since backward search faces opposite direction
+            flipped_heading = (math.degrees(node.state.heading) + 180) % 360
+            
+            curvature = 0.0
+            if node.primitive is not None:
+                curvature = node.primitive.curvature
+            
+            path_segments.append(PathSegment(
+                x=node.state.x,
+                y=node.state.y,
+                heading=flipped_heading,
+                elevation=elev,
+                curvature=curvature,
+                direction_gear=node.state.direction_gear,
+                structure_type=node.structure_type,
+                is_switchback=node.is_switchback
+            ))
+        
+        # Now reverse so it goes from meeting point toward goal
+        path_segments.reverse()
+        
+        return path_segments
+    
     def _find_path_segment(
         self,
         start_x: float, start_y: float,
@@ -2362,6 +2801,19 @@ class KinodynamicPathfinder:
         Unlike find_path, this takes the full initial state including
         direction_gear and last_switchback position.
         """
+        # Use bidirectional search if enabled
+        if self.config.bidirectional_search:
+            return self._find_path_segment_bidirectional(
+                start_x=start_x, start_y=start_y,
+                goal_x=goal_x, goal_y=goal_y,
+                initial_heading=initial_heading,
+                initial_direction_gear=initial_direction_gear,
+                last_switchback_x=last_switchback_x,
+                last_switchback_y=last_switchback_y,
+                max_iterations=max_iterations,
+                goal_tolerance=goal_tolerance
+            )
+        
         start_time = time.time()
         
         # Convert heading to radians for internal State
@@ -2406,6 +2858,10 @@ class KinodynamicPathfinder:
         stall_counter = 0  # Track how many intervals without progress
         last_best_distance = initial_distance
         current_heuristic_weight = self.config.heuristic_weight  # Start with normal weight
+        
+        # Track best progress node for partial path on failure
+        best_progress_node: Optional[PathNode] = start_node
+        best_progress_dist: float = initial_distance
         
         while open_set and iterations < max_iterations:
             iterations += 1
@@ -2515,6 +2971,14 @@ class KinodynamicPathfinder:
             closed_set.add(state_key)
             nodes_expanded += 1
             
+            # Track best progress node for partial path on failure
+            current_dist = math.sqrt(
+                (goal_x - current.state.x)**2 + (goal_y - current.state.y)**2
+            )
+            if current_dist < best_progress_dist:
+                best_progress_dist = current_dist
+                best_progress_node = current
+            
             neighbors = self.neighbor_generator.get_neighbors(current.state, goal_x, goal_y)
             
             for neighbor in neighbors:
@@ -2549,13 +3013,17 @@ class KinodynamicPathfinder:
         
         elapsed = time.time() - start_time
         
-        # Find the best node we reached for failure info
+        # Use best progress node for failure location and partial path
         failure_x = start_x
         failure_y = start_y
-        if open_set:
-            best_node = open_set[0][2]
-            failure_x = best_node.state.x
-            failure_y = best_node.state.y
+        partial_path: List[PathSegment] = []
+        
+        if best_progress_node is not None:
+            failure_x = best_progress_node.state.x
+            failure_y = best_progress_node.state.y
+            # Reconstruct partial path to best progress point
+            partial_path = self._reconstruct_path(best_progress_node)
+            print(f"[Kinodynamic] Partial path: {len(partial_path)} segments to ({failure_x:.0f}, {failure_y:.0f})")
         
         if iterations >= max_iterations:
             message = f"Segment terminated: max iterations ({max_iterations}) reached"
@@ -2564,7 +3032,7 @@ class KinodynamicPathfinder:
         
         return PathResult(
             success=False,
-            path=[],
+            path=partial_path,  # Include partial path!
             total_cost=float('inf'),
             iterations=iterations,
             nodes_expanded=nodes_expanded,
@@ -2572,5 +3040,5 @@ class KinodynamicPathfinder:
             message=message,
             failure_x=failure_x,
             failure_y=failure_y,
-            best_distance_remaining=best_distance_so_far
+            best_distance_remaining=best_progress_dist
         )
