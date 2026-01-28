@@ -2295,9 +2295,19 @@ class KinodynamicPathfinder:
             
             if not segment_result.success:
                 elapsed = time.time() - start_time
+                # Combine already-completed segments with partial path from failed segment
+                partial_path = all_segments.copy()
+                if segment_result.path:
+                    # Add the partial path from the failed segment
+                    if partial_path:
+                        # Skip first point to avoid duplicate
+                        partial_path.extend(segment_result.path[1:])
+                    else:
+                        partial_path.extend(segment_result.path)
+                
                 return PathResult(
                     success=False,
-                    path=all_segments,  # Return partial path
+                    path=partial_path,  # Return partial path including failed segment's progress
                     total_cost=total_cost,
                     iterations=total_iterations + segment_result.iterations,
                     nodes_expanded=total_nodes_expanded + segment_result.nodes_expanded,
@@ -2434,8 +2444,9 @@ class KinodynamicPathfinder:
         def position_bucket(x: float, y: float) -> Tuple[int, int]:
             return (int(x / meeting_bucket_size), int(y / meeting_bucket_size))
         
-        forward_positions: Dict[Tuple[int, int], List[PathNode]] = {}
-        backward_positions: Dict[Tuple[int, int], List[PathNode]] = {}
+        # Store only one node per bucket for efficiency
+        forward_positions: Dict[Tuple[int, int], PathNode] = {}
+        backward_positions: Dict[Tuple[int, int], PathNode] = {}
         
         # Track expansions for balanced alternation
         forward_expansions = 0
@@ -2477,11 +2488,11 @@ class KinodynamicPathfinder:
                 nodes_expanded += 1
                 forward_expansions += 1
                 
-                # Track position for meeting detection
+                # Track position for meeting detection (only store one node per bucket to reduce memory/lookup)
                 pos_bucket = position_bucket(current.state.x, current.state.y)
+                # Only store if we don't already have a node in this bucket (first one is usually best)
                 if pos_bucket not in forward_positions:
-                    forward_positions[pos_bucket] = []
-                forward_positions[pos_bucket].append(current)
+                    forward_positions[pos_bucket] = current
                 
                 # Check if we've reached the actual goal
                 if self.is_goal(current.state, goal_x, goal_y, goal_tolerance):
@@ -2494,25 +2505,20 @@ class KinodynamicPathfinder:
                         message=f"Segment found (forward reached goal) in {iterations} iterations"
                     )
                 
-                # Check for meeting with backward search
-                for nearby_bucket in [pos_bucket, 
-                                      (pos_bucket[0]-1, pos_bucket[1]),
-                                      (pos_bucket[0]+1, pos_bucket[1]),
-                                      (pos_bucket[0], pos_bucket[1]-1),
-                                      (pos_bucket[0], pos_bucket[1]+1)]:
-                    if nearby_bucket in backward_positions:
-                        for back_node in backward_positions[nearby_bucket]:
-                            dist = math.sqrt(
-                                (current.state.x - back_node.state.x)**2 +
-                                (current.state.y - back_node.state.y)**2
-                            )
-                            if dist < goal_tolerance * 2:
-                                # Found a meeting point!
-                                meeting_cost = current.g_cost + back_node.g_cost + dist
-                                if meeting_cost < best_meeting_cost:
-                                    best_meeting_cost = meeting_cost
-                                    best_meeting_forward_node = current
-                                    best_meeting_backward_node = back_node
+                # Check for meeting with backward search (optimized - only check exact bucket)
+                if pos_bucket in backward_positions:
+                    back_node = backward_positions[pos_bucket]
+                    dist = math.sqrt(
+                        (current.state.x - back_node.state.x)**2 +
+                        (current.state.y - back_node.state.y)**2
+                    )
+                    if dist < goal_tolerance * 2:
+                        # Found a meeting point!
+                        meeting_cost = current.g_cost + back_node.g_cost + dist
+                        if meeting_cost < best_meeting_cost:
+                            best_meeting_cost = meeting_cost
+                            best_meeting_forward_node = current
+                            best_meeting_backward_node = back_node
                 
                 # Update best forward distance and track best progress node
                 dist_to_goal = math.sqrt(
@@ -2565,11 +2571,10 @@ class KinodynamicPathfinder:
                 nodes_expanded += 1
                 backward_expansions += 1
                 
-                # Track position for meeting detection
+                # Track position for meeting detection (only store one node per bucket)
                 pos_bucket = position_bucket(current.state.x, current.state.y)
                 if pos_bucket not in backward_positions:
-                    backward_positions[pos_bucket] = []
-                backward_positions[pos_bucket].append(current)
+                    backward_positions[pos_bucket] = current
                 
                 # Check if backward reached the start
                 if self.is_goal(current.state, start_x, start_y, goal_tolerance):
@@ -2583,24 +2588,19 @@ class KinodynamicPathfinder:
                         message=f"Segment found (backward reached start) in {iterations} iterations"
                     )
                 
-                # Check for meeting with forward search
-                for nearby_bucket in [pos_bucket,
-                                      (pos_bucket[0]-1, pos_bucket[1]),
-                                      (pos_bucket[0]+1, pos_bucket[1]),
-                                      (pos_bucket[0], pos_bucket[1]-1),
-                                      (pos_bucket[0], pos_bucket[1]+1)]:
-                    if nearby_bucket in forward_positions:
-                        for fwd_node in forward_positions[nearby_bucket]:
-                            dist = math.sqrt(
-                                (current.state.x - fwd_node.state.x)**2 +
-                                (current.state.y - fwd_node.state.y)**2
-                            )
-                            if dist < goal_tolerance * 2:
-                                meeting_cost = fwd_node.g_cost + current.g_cost + dist
-                                if meeting_cost < best_meeting_cost:
-                                    best_meeting_cost = meeting_cost
-                                    best_meeting_forward_node = fwd_node
-                                    best_meeting_backward_node = current
+                # Check for meeting with forward search (optimized - only check exact bucket)
+                if pos_bucket in forward_positions:
+                    fwd_node = forward_positions[pos_bucket]
+                    dist = math.sqrt(
+                        (current.state.x - fwd_node.state.x)**2 +
+                        (current.state.y - fwd_node.state.y)**2
+                    )
+                    if dist < goal_tolerance * 2:
+                        meeting_cost = fwd_node.g_cost + current.g_cost + dist
+                        if meeting_cost < best_meeting_cost:
+                            best_meeting_cost = meeting_cost
+                            best_meeting_forward_node = fwd_node
+                            best_meeting_backward_node = current
                 
                 # Update best backward distance
                 dist_to_start = math.sqrt(
