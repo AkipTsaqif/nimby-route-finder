@@ -295,6 +295,9 @@ function App() {
 	const [maxIterations, setMaxIterations] = useState(() =>
 		loadConfig("maxIterations", 500000),
 	);
+	const [bidirectionalSearch, setBidirectionalSearch] = useState(() =>
+		loadConfig("bidirectionalSearch", false),
+	);
 
 	// Map tile layer
 	type MapTileType = "osm" | "openrailwaymap";
@@ -336,6 +339,7 @@ function App() {
 			roadMaxSeparation,
 			useKinodynamic,
 			maxIterations,
+			bidirectionalSearch,
 			mapTileType,
 			showGridNodes,
 		};
@@ -367,6 +371,7 @@ function App() {
 		roadMaxSeparation,
 		useKinodynamic,
 		maxIterations,
+		bidirectionalSearch,
 		mapTileType,
 		showGridNodes,
 	]);
@@ -651,6 +656,7 @@ function App() {
 					// Pathfinder selection
 					use_kinodynamic: useKinodynamic,
 					max_iterations: maxIterations,
+					bidirectional_search: bidirectionalSearch,
 				}),
 			});
 
@@ -1137,25 +1143,64 @@ function App() {
 							: "Legacy: 8-direction grid, faster but angular"}
 					</p>
 					{useKinodynamic && (
-						<div
-							className="control-group"
-							style={{ marginTop: "0.5rem" }}
-						>
-							<label>Max Iterations</label>
-							<input
-								type="range"
-								min="100000"
-								max="2000000"
-								step="100000"
-								value={maxIterations}
-								onChange={(e) =>
-									setMaxIterations(parseInt(e.target.value))
-								}
-							/>
-							<span className="value">
-								{(maxIterations / 1000).toFixed(0)}k
-							</span>
-						</div>
+						<>
+							<div
+								className="control-group"
+								style={{ marginTop: "0.5rem" }}
+							>
+								<label>Max Iterations</label>
+								<input
+									type="range"
+									min="100000"
+									max="2000000"
+									step="100000"
+									value={maxIterations}
+									onChange={(e) =>
+										setMaxIterations(
+											parseInt(e.target.value),
+										)
+									}
+								/>
+								<span className="value">
+									{(maxIterations / 1000).toFixed(0)}k
+								</span>
+							</div>
+							<div
+								className="control-group"
+								style={{
+									display: "flex",
+									alignItems: "center",
+									gap: "0.5rem",
+									marginTop: "0.5rem",
+								}}
+							>
+								<input
+									type="checkbox"
+									id="bidirectionalSearch"
+									checked={bidirectionalSearch}
+									onChange={(e) =>
+										setBidirectionalSearch(e.target.checked)
+									}
+									style={{ width: "auto" }}
+								/>
+								<label
+									htmlFor="bidirectionalSearch"
+									style={{ cursor: "pointer" }}
+								>
+									Bidirectional Search
+								</label>
+							</div>
+							<p
+								style={{
+									fontSize: "0.75rem",
+									color: "#888",
+									marginTop: "0.25rem",
+								}}
+							>
+								Search from both ends to find paths around
+								obstacles faster
+							</p>
+						</>
 					)}
 				</div>
 
