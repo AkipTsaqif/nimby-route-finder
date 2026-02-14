@@ -37,6 +37,7 @@ export interface RouteStats {
 	elapsed_time_s?: number;
 	// Failure info (when success=false but partial path exists)
 	failure_location?: [number, number]; // [lng, lat]
+	failure_location_backward?: [number, number]; // [lng, lat] - for bidirectional search
 	failure_segment?: number;
 	best_distance_remaining?: number;
 }
@@ -75,12 +76,14 @@ export interface RouteGeoJSONProperties {
 	// Partial path info
 	is_partial?: boolean;
 	failure_point?: [number, number]; // [lng, lat]
+	failure_point_backward?: [number, number]; // [lng, lat] - for bidirectional search
+	has_gap?: boolean; // True if path has discontinuity (forward + backward partial paths)
 	pathfinder?: "legacy" | "kinodynamic";
 }
 
 export interface RouteGeometry {
-	type: "LineString";
-	coordinates: number[][]; // [lng, lat, elevation]
+	type: "LineString" | "MultiLineString";
+	coordinates: number[][] | number[][][]; // LineString: [lng, lat, elevation][] or MultiLineString: [lng, lat][][]
 }
 
 export interface RouteGeoJSON {

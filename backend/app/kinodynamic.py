@@ -95,6 +95,8 @@ class KinodynamicConfig:
     # === Water Avoidance ===
     water_penalty: float = 10000.0  # Cost to cross water (if not bridged)
     water_elevation_threshold: float = 1.0  # Elevation threshold for water detection
+    allow_water_crossing: bool = False  # If True, allow crossing water with penalty instead of blocking
+    max_water_crossing_m: float = 100.0  # Maximum width of water that can be crossed (for small creeks)
     
     # === Structure Costs ===
     tunnel_cost_per_m: float = 50.0  # Extra cost per meter in tunnel
@@ -1266,19 +1268,32 @@ class NeighborGenerator:
         
         Returns:
             Additional water cost if valid (0 if no water, or bridge zone)
-            High penalty if crosses water without a bridge (soft constraint)
+            High penalty if crosses water without a bridge (soft constraint when allow_water_crossing=True)
+            None if water crossing is blocked (hard constraint when allow_water_crossing=False)
         """
         water_cost = 0.0
+        water_points = 0
+        
         for x, y in positions:
             if self.constraints.is_water(x, y):
                 if in_bridge:
                     # Water crossing allowed in bridge zone
                     pass
+                elif self.config.allow_water_crossing:
+                    # Water crossing with penalty (soft constraint)
+                    water_points += 1
+                    water_cost += self.config.water_penalty
                 else:
-                    # Water crossing - apply heavy penalty instead of blocking
-                    # This allows finding a path even if water is in the way
-                    # water_cost += self.config.water_penalty
+                    # Water crossing blocked (hard constraint)
                     return None
+        
+        # If allowing water crossing, check if it's too wide
+        if water_points > 0 and self.config.allow_water_crossing:
+            # Estimate water width: each position sample is roughly step_distance / 10
+            water_width_estimate = water_points * (self.config.step_distance_m / 10)
+            if water_width_estimate > self.config.max_water_crossing_m:
+                # Too wide to cross without a bridge
+                return None
         
         return water_cost  # Return penalty (may be 0 if no water)
     
@@ -1681,6 +1696,9 @@ class PathResult:
     failure_y: Optional[float] = None  # Local Y coordinate where search failed
     failure_segment: Optional[int] = None  # Which segment (0-indexed) failed
     best_distance_remaining: Optional[float] = None  # Distance to goal when failed
+    # Bidirectional search backward failure location
+    failure_x_backward: Optional[float] = None  # Where backward search got stuck
+    failure_y_backward: Optional[float] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -1698,6 +1716,8 @@ class PathResult:
             result['failure_y'] = self.failure_y
             result['failure_segment'] = self.failure_segment
             result['best_distance_remaining'] = self.best_distance_remaining
+            result['failure_x_backward'] = self.failure_x_backward
+            result['failure_y_backward'] = self.failure_y_backward
         return result
 
 
@@ -1814,6 +1834,8 @@ class KinodynamicPathfinder:
         print(f"[STALL DIAGNOSTIC] Terrain scan toward goal:")
         
         obstacles_found = []
+        prev_sample_t = 0.0
+        prev_elev = elev_here
         for i in range(1, 6):  # Sample 5 steps toward goal
             sample_t = i / 5 * min(best_distance_so_far, step * 5)
             sample_x = pos_x + dx * sample_t / best_distance_so_far
@@ -1825,10 +1847,8 @@ class KinodynamicPathfinder:
             is_tunnel = self.constraints.is_tunnel_zone(sample_x, sample_y)
             
             # Calculate slope from previous point
-            if i == 1:
-                prev_elev = elev_here
             slope_rise = sample_elev - prev_elev
-            slope_run = sample_t / 5
+            slope_run = sample_t - prev_sample_t  # Distance between consecutive samples
             slope_pct = abs(slope_rise / slope_run * 100) if slope_run > 0 else 0
             
             status = []
@@ -1848,6 +1868,7 @@ class KinodynamicPathfinder:
             status_str = " ".join(status) if status else "clear"
             print(f"[STALL DIAGNOSTIC]   +{sample_t:.0f}m: elev={sample_elev:.1f}m, {status_str}")
             prev_elev = sample_elev
+            prev_sample_t = sample_t
         
         # Check neighbors and why they aren't helping
         neighbors = self.neighbor_generator.get_neighbors(state, goal_x, goal_y)
@@ -1885,6 +1906,15 @@ class KinodynamicPathfinder:
                 else:
                     away_from_goal += 1
             print(f"[STALL DIAGNOSTIC]   {toward_goal} moves toward goal, {away_from_goal} moves away")
+            
+            # Show the actual neighbor headings and distances
+            if toward_goal == 0:
+                print(f"[STALL DIAGNOSTIC]   Detailed neighbor info (first 5):")
+                for i, n in enumerate(neighbors[:5]):
+                    n_dist = math.sqrt((goal_x - n.state.x)**2 + (goal_y - n.state.y)**2)
+                    delta_dist = n_dist - best_distance_so_far
+                    heading_deg = math.degrees(n.state.heading) % 360
+                    print(f"[STALL DIAGNOSTIC]     #{i+1}: heading={heading_deg:.1f}°, dist to goal={n_dist:.0f}m (Δ={delta_dist:+.0f}m), cost={n.cost:.0f}")
             
             if toward_goal > 0:
                 print(f"[STALL DIAGNOSTIC]   ⚠️ Moves toward goal exist but aren't being selected!")
@@ -2432,6 +2462,10 @@ class KinodynamicPathfinder:
         best_forward_progress_node: Optional[PathNode] = forward_node
         best_forward_progress_dist: float = initial_distance
         
+        # Track best backward progress node (closest to start) for partial path on failure
+        best_backward_progress_node: Optional[PathNode] = backward_node
+        best_backward_progress_dist: float = initial_distance
+        
         # Meeting point tracking
         best_meeting_cost = float('inf')
         best_meeting_forward_node: Optional[PathNode] = None
@@ -2505,20 +2539,25 @@ class KinodynamicPathfinder:
                         message=f"Segment found (forward reached goal) in {iterations} iterations"
                     )
                 
-                # Check for meeting with backward search (optimized - only check exact bucket)
-                if pos_bucket in backward_positions:
-                    back_node = backward_positions[pos_bucket]
-                    dist = math.sqrt(
-                        (current.state.x - back_node.state.x)**2 +
-                        (current.state.y - back_node.state.y)**2
-                    )
-                    if dist < goal_tolerance * 2:
-                        # Found a meeting point!
-                        meeting_cost = current.g_cost + back_node.g_cost + dist
-                        if meeting_cost < best_meeting_cost:
-                            best_meeting_cost = meeting_cost
-                            best_meeting_forward_node = current
-                            best_meeting_backward_node = back_node
+                # Check for meeting with backward search (check nearby buckets too)
+                for nearby_bucket in [pos_bucket,
+                                      (pos_bucket[0]-1, pos_bucket[1]),
+                                      (pos_bucket[0]+1, pos_bucket[1]),
+                                      (pos_bucket[0], pos_bucket[1]-1),
+                                      (pos_bucket[0], pos_bucket[1]+1)]:
+                    if nearby_bucket in backward_positions:
+                        back_node = backward_positions[nearby_bucket]
+                        dist = math.sqrt(
+                            (current.state.x - back_node.state.x)**2 +
+                            (current.state.y - back_node.state.y)**2
+                        )
+                        if dist < goal_tolerance * 2:
+                            # Found a meeting point!
+                            meeting_cost = current.g_cost + back_node.g_cost + dist
+                            if meeting_cost < best_meeting_cost:
+                                best_meeting_cost = meeting_cost
+                                best_meeting_forward_node = current
+                                best_meeting_backward_node = back_node
                 
                 # Update best forward distance and track best progress node
                 dist_to_goal = math.sqrt(
@@ -2588,24 +2627,32 @@ class KinodynamicPathfinder:
                         message=f"Segment found (backward reached start) in {iterations} iterations"
                     )
                 
-                # Check for meeting with forward search (optimized - only check exact bucket)
-                if pos_bucket in forward_positions:
-                    fwd_node = forward_positions[pos_bucket]
-                    dist = math.sqrt(
-                        (current.state.x - fwd_node.state.x)**2 +
-                        (current.state.y - fwd_node.state.y)**2
-                    )
-                    if dist < goal_tolerance * 2:
-                        meeting_cost = fwd_node.g_cost + current.g_cost + dist
-                        if meeting_cost < best_meeting_cost:
-                            best_meeting_cost = meeting_cost
-                            best_meeting_forward_node = fwd_node
-                            best_meeting_backward_node = current
+                # Check for meeting with forward search (check nearby buckets too)
+                for nearby_bucket in [pos_bucket,
+                                      (pos_bucket[0]-1, pos_bucket[1]),
+                                      (pos_bucket[0]+1, pos_bucket[1]),
+                                      (pos_bucket[0], pos_bucket[1]-1),
+                                      (pos_bucket[0], pos_bucket[1]+1)]:
+                    if nearby_bucket in forward_positions:
+                        fwd_node = forward_positions[nearby_bucket]
+                        dist = math.sqrt(
+                            (current.state.x - fwd_node.state.x)**2 +
+                            (current.state.y - fwd_node.state.y)**2
+                        )
+                        if dist < goal_tolerance * 2:
+                            meeting_cost = fwd_node.g_cost + current.g_cost + dist
+                            if meeting_cost < best_meeting_cost:
+                                best_meeting_cost = meeting_cost
+                                best_meeting_forward_node = fwd_node
+                                best_meeting_backward_node = current
                 
-                # Update best backward distance
+                # Update best backward distance and track best backward progress node
                 dist_to_start = math.sqrt(
                     (start_x - current.state.x)**2 + (start_y - current.state.y)**2
                 )
+                if dist_to_start < best_backward_progress_dist:
+                    best_backward_progress_dist = dist_to_start
+                    best_backward_progress_node = current
                 best_backward_dist = min(best_backward_dist, dist_to_start)
                 
                 # Expand backward neighbors (toward start)
@@ -2652,15 +2699,70 @@ class KinodynamicPathfinder:
                       f"bwd:{backward_expansions:,}exp/{len(backward_open):,}q/{backward_progress:.1f}%, "
                       f"{elapsed:.1f}s{meeting_info}")
                 
-                # Diagnostic: if forward search is stuck at 0%, log why
-                if forward_progress < 1.0 and iterations > 20000:
-                    if len(forward_open) <= 10:
-                        print(f"[Kinodynamic-Bidir] ⚠️ Forward search has only {len(forward_open)} nodes in queue!")
-                        print(f"[Kinodynamic-Bidir]    Forward expanded: {forward_expansions}, Backward expanded: {backward_expansions}")
-                        if forward_open:
-                            top_node = forward_open[0][2]
-                            print(f"[Kinodynamic-Bidir]    Top forward node: pos=({top_node.state.x:.0f},{top_node.state.y:.0f}), "
-                                  f"heading={math.degrees(top_node.state.heading):.1f}°, f={forward_open[0][0]:.0f}")
+                # === STALL DETECTION for bidirectional search ===
+                # Check if both searches are stuck (no progress in last interval)
+                fwd_stalled = abs(forward_progress - getattr(self, '_last_fwd_progress', 0)) < 0.1
+                bwd_stalled = abs(backward_progress - getattr(self, '_last_bwd_progress', 0)) < 0.1
+                self._last_fwd_progress = forward_progress
+                self._last_bwd_progress = backward_progress
+                
+                if fwd_stalled and bwd_stalled and iterations > 50000:
+                    # Both searches stalled - diagnose why
+                    print(f"\n[Kinodynamic-Bidir] ⚠️ BOTH SEARCHES STALLED!")
+                    
+                    # Forward search diagnosis
+                    if best_forward_progress_node:
+                        fwd_state = best_forward_progress_node.state
+                        fwd_lat, fwd_lng = self.elevation_grid.transform.to_latlon(fwd_state.x, fwd_state.y)
+                        fwd_elev = self.elevation_grid.get_elevation(fwd_state.x, fwd_state.y)
+                        print(f"[Kinodynamic-Bidir] Forward stuck at: ({fwd_state.x:.0f}, {fwd_state.y:.0f})")
+                        print(f"[Kinodynamic-Bidir]   Lat/Lng: {fwd_lat:.6f}, {fwd_lng:.6f}")
+                        print(f"[Kinodynamic-Bidir]   Elevation: {fwd_elev:.1f}m, Heading: {math.degrees(fwd_state.heading):.1f}°")
+                        
+                        # Check terrain toward goal
+                        dx = goal_x - fwd_state.x
+                        dy = goal_y - fwd_state.y
+                        dist_to_goal = math.sqrt(dx*dx + dy*dy)
+                        for step in [100, 200, 300]:
+                            if step < dist_to_goal:
+                                sx = fwd_state.x + dx * step / dist_to_goal
+                                sy = fwd_state.y + dy * step / dist_to_goal
+                                se = self.elevation_grid.get_elevation(sx, sy)
+                                slope = abs(se - fwd_elev) / step * 100
+                                water = "🌊" if self.constraints.is_water(sx, sy) else ""
+                                steep = "⛰️" if slope > self.config.hard_slope_limit_percent else ""
+                                print(f"[Kinodynamic-Bidir]   +{step}m toward goal: elev={se:.1f}m, slope={slope:.1f}% {steep}{water}")
+                    
+                    # Backward search diagnosis
+                    if best_backward_progress_node:
+                        bwd_state = best_backward_progress_node.state
+                        bwd_lat, bwd_lng = self.elevation_grid.transform.to_latlon(bwd_state.x, bwd_state.y)
+                        bwd_elev = self.elevation_grid.get_elevation(bwd_state.x, bwd_state.y)
+                        print(f"[Kinodynamic-Bidir] Backward stuck at: ({bwd_state.x:.0f}, {bwd_state.y:.0f})")
+                        print(f"[Kinodynamic-Bidir]   Lat/Lng: {bwd_lat:.6f}, {bwd_lng:.6f}")
+                        print(f"[Kinodynamic-Bidir]   Elevation: {bwd_elev:.1f}m, Heading: {math.degrees(bwd_state.heading):.1f}°")
+                        
+                        # Check terrain toward start
+                        dx = start_x - bwd_state.x
+                        dy = start_y - bwd_state.y
+                        dist_to_start = math.sqrt(dx*dx + dy*dy)
+                        for step in [100, 200, 300]:
+                            if step < dist_to_start:
+                                sx = bwd_state.x + dx * step / dist_to_start
+                                sy = bwd_state.y + dy * step / dist_to_start
+                                se = self.elevation_grid.get_elevation(sx, sy)
+                                slope = abs(se - bwd_elev) / step * 100
+                                water = "🌊" if self.constraints.is_water(sx, sy) else ""
+                                steep = "⛰️" if slope > self.config.hard_slope_limit_percent else ""
+                                print(f"[Kinodynamic-Bidir]   +{step}m toward start: elev={se:.1f}m, slope={slope:.1f}% {steep}{water}")
+                    
+                    # Gap analysis - distance between the two stuck points
+                    if best_forward_progress_node and best_backward_progress_node:
+                        gap_x = best_backward_progress_node.state.x - best_forward_progress_node.state.x
+                        gap_y = best_backward_progress_node.state.y - best_forward_progress_node.state.y
+                        gap_dist = math.sqrt(gap_x*gap_x + gap_y*gap_y)
+                        print(f"[Kinodynamic-Bidir] Gap between stuck points: {gap_dist/1000:.1f}km")
+                        print(f"[Kinodynamic-Bidir] 💡 TIP: Add waypoints/bridges in the gap, or adjust route around water\n")
                 
                 # If we have a meeting and both searches are making no more progress, use it
                 if best_meeting_forward_node is not None:
@@ -2693,20 +2795,35 @@ class KinodynamicPathfinder:
                 message=f"Segment found via bidirectional meeting in {iterations} iterations"
             )
         
-        # No path found - include partial path from best progress node
+        # No path found - include partial paths from both directions
         failure_x = start_x
         failure_y = start_y
         best_dist = initial_distance
         partial_path: List[PathSegment] = []
         
-        # Use best progress node for failure location and partial path
+        # Use best forward progress node for failure location and partial path
         if best_forward_progress_node is not None:
             failure_x = best_forward_progress_node.state.x
             failure_y = best_forward_progress_node.state.y
             best_dist = best_forward_progress_dist
-            # Reconstruct partial path to best progress point
+            # Reconstruct partial path from start to best forward progress
             partial_path = self._reconstruct_path(best_forward_progress_node)
-            print(f"[Kinodynamic-Bidir] Partial path: {len(partial_path)} segments to ({failure_x:.0f}, {failure_y:.0f})")
+            print(f"[Kinodynamic-Bidir] Forward partial path: {len(partial_path)} segments to ({failure_x:.0f}, {failure_y:.0f})")
+        
+        # Also include backward partial path (from goal toward start)
+        backward_partial_path: List[PathSegment] = []
+        if best_backward_progress_node is not None and best_backward_progress_node.parent is not None:
+            # Reconstruct backward path - this goes from goal toward where backward search reached
+            backward_partial_path = self._reconstruct_path_reversed(best_backward_progress_node)
+            print(f"[Kinodynamic-Bidir] Backward partial path: {len(backward_partial_path)} segments from goal")
+            
+            # Combine: forward path + gap + backward path
+            # The backward path starts from goal and goes toward start
+            # We append it to show both explored regions
+            if partial_path and backward_partial_path:
+                # Add a gap marker (empty segment list is fine, frontend will see the discontinuity)
+                partial_path.extend(backward_partial_path)
+                print(f"[Kinodynamic-Bidir] Combined partial path: {len(partial_path)} total segments")
         
         if iterations >= max_iterations:
             message = f"Bidirectional search: max iterations ({max_iterations}) reached"
@@ -2715,7 +2832,7 @@ class KinodynamicPathfinder:
         
         return PathResult(
             success=False,
-            path=partial_path,  # Include partial path!
+            path=partial_path,  # Include combined partial paths from both directions!
             total_cost=float('inf'),
             iterations=iterations,
             nodes_expanded=nodes_expanded,
@@ -2723,7 +2840,10 @@ class KinodynamicPathfinder:
             message=message,
             failure_x=failure_x,
             failure_y=failure_y,
-            best_distance_remaining=best_dist
+            best_distance_remaining=best_dist,
+            # Also include backward failure location for visualization
+            failure_x_backward=best_backward_progress_node.state.x if best_backward_progress_node else None,
+            failure_y_backward=best_backward_progress_node.state.y if best_backward_progress_node else None
         )
     
     def _reconstruct_path_reversed(self, goal_node: PathNode) -> List[PathSegment]:
@@ -2854,7 +2974,6 @@ class KinodynamicPathfinder:
         
         # Calculate initial distance for progress tracking
         initial_distance = math.sqrt((goal_x - start_x)**2 + (goal_y - start_y)**2)
-        best_distance_so_far = initial_distance
         stall_counter = 0  # Track how many intervals without progress
         last_best_distance = initial_distance
         current_heuristic_weight = self.config.heuristic_weight  # Start with normal weight
@@ -2869,60 +2988,54 @@ class KinodynamicPathfinder:
             # Progress logging
             if iterations % progress_interval == 0:
                 elapsed = time.time() - start_time
-                current_best = open_set[0][2] if open_set else None
-                if current_best:
-                    dist_to_goal = math.sqrt(
-                        (goal_x - current_best.state.x)**2 + 
-                        (goal_y - current_best.state.y)**2
+                # Use best_progress_dist (updated during expansion) for accurate tracking
+                progress_pct = (1 - best_progress_dist / initial_distance) * 100
+                
+                # Detect stall
+                if best_progress_dist >= last_best_distance - 1:  # No meaningful progress
+                    stall_counter += 1
+                else:
+                    stall_counter = 0
+                last_best_distance = best_progress_dist
+                
+                stall_info = f" (stalled {stall_counter}x)" if stall_counter >= 3 else ""
+                weight_info = f" [weight={current_heuristic_weight:.2f}]" if current_heuristic_weight != self.config.heuristic_weight else ""
+                print(f"[Kinodynamic] {iterations:,} iterations, {nodes_expanded:,} expanded, "
+                      f"{len(open_set):,} queued, {elapsed:.1f}s, "
+                      f"best dist: {best_progress_dist:.0f}m ({progress_pct:.1f}%){stall_info}{weight_info}")
+                
+                # If stalled for too long, perform detailed diagnostics
+                if stall_counter == 5 and best_progress_node is not None:
+                    self._diagnose_stall(
+                        best_progress_node, goal_x, goal_y, initial_distance,
+                        best_progress_dist
                     )
-                    best_distance_so_far = min(best_distance_so_far, dist_to_goal)
-                    progress_pct = (1 - best_distance_so_far / initial_distance) * 100
                     
-                    # Detect stall
-                    if best_distance_so_far >= last_best_distance - 1:  # No meaningful progress
-                        stall_counter += 1
-                    else:
-                        stall_counter = 0
-                    last_best_distance = best_distance_so_far
-                    
-                    stall_info = f" (stalled {stall_counter}x)" if stall_counter >= 3 else ""
-                    weight_info = f" [weight={current_heuristic_weight:.2f}]" if current_heuristic_weight != self.config.heuristic_weight else ""
-                    print(f"[Kinodynamic] {iterations:,} iterations, {nodes_expanded:,} expanded, "
-                          f"{len(open_set):,} queued, {elapsed:.1f}s, "
-                          f"best dist: {best_distance_so_far:.0f}m ({progress_pct:.1f}%){stall_info}{weight_info}")
-                    
-                    # If stalled for too long, perform detailed diagnostics
-                    if stall_counter == 5:
-                        self._diagnose_stall(
-                            current_best, goal_x, goal_y, initial_distance,
-                            best_distance_so_far
-                        )
+                    # === STALL RECOVERY: Reduce heuristic weight ===
+                    # When search is stuck, reduce greediness to explore more broadly
+                    if current_heuristic_weight > 1.0:
+                        new_weight = max(1.0, current_heuristic_weight - 0.25)
+                        print(f"[Kinodynamic] 🔧 STALL RECOVERY: Reducing heuristic weight "
+                              f"from {current_heuristic_weight:.2f} to {new_weight:.2f}")
+                        print(f"[Kinodynamic]    This makes A* less greedy and more exploratory")
+                        current_heuristic_weight = new_weight
                         
-                        # === STALL RECOVERY: Reduce heuristic weight ===
-                        # When search is stuck, reduce greediness to explore more broadly
-                        if current_heuristic_weight > 1.0:
-                            new_weight = max(1.0, current_heuristic_weight - 0.25)
-                            print(f"[Kinodynamic] 🔧 STALL RECOVERY: Reducing heuristic weight "
-                                  f"from {current_heuristic_weight:.2f} to {new_weight:.2f}")
-                            print(f"[Kinodynamic]    This makes A* less greedy and more exploratory")
-                            current_heuristic_weight = new_weight
-                            
-                            # Recompute f-costs for nodes in open set with new weight
-                            # This allows nodes that were "behind" to become competitive
-                            new_open_set: List[Tuple[float, int, PathNode]] = []
-                            for _, seq, node in open_set:
-                                new_h = self.heuristic(node.state, goal_x, goal_y, current_heuristic_weight)
-                                new_f = node.g_cost + new_h
-                                heapq.heappush(new_open_set, (new_f, seq, node))
-                            open_set = new_open_set
-                            print(f"[Kinodynamic]    Recomputed f-costs for {len(open_set)} queued nodes")
-                            
-                            # Reset stall counter after recovery attempt
-                            stall_counter = 0
-                        else:
-                            print(f"[Kinodynamic] ⚠️ Already at minimum weight (1.0), can't reduce further")
-                            print(f"[Kinodynamic]    This path may be truly blocked by terrain/water")
-                            print(f"[Kinodynamic]    Consider adding waypoints or tunnel/bridge markers")
+                        # Recompute f-costs for nodes in open set with new weight
+                        # This allows nodes that were "behind" to become competitive
+                        new_open_set: List[Tuple[float, int, PathNode]] = []
+                        for _, seq, node in open_set:
+                            new_h = self.heuristic(node.state, goal_x, goal_y, current_heuristic_weight)
+                            new_f = node.g_cost + new_h
+                            heapq.heappush(new_open_set, (new_f, seq, node))
+                        open_set = new_open_set
+                        print(f"[Kinodynamic]    Recomputed f-costs for {len(open_set)} queued nodes")
+                        
+                        # Reset stall counter after recovery attempt
+                        stall_counter = 0
+                    else:
+                        print(f"[Kinodynamic] ⚠️ Already at minimum weight (1.0), can't reduce further")
+                        print(f"[Kinodynamic]    This path may be truly blocked by terrain/water")
+                        print(f"[Kinodynamic]    Consider adding waypoints or tunnel/bridge markers")
             
             _, _, current = heapq.heappop(open_set)
             

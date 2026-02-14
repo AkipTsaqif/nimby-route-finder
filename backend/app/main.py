@@ -385,7 +385,9 @@ async def generate_route(request: RouteRequest):
             switchback_penalty=request.switchback_penalty,
             min_switchback_distance_m=request.min_switchback_interval * adaptive_step,
             # Water
+            allow_water_crossing=request.allow_water_crossing,
             water_penalty=100.0 if request.allow_water_crossing else 10000.0,
+            max_water_crossing_m=200.0,  # Allow crossing water up to 200m wide (rivers)
             # Structures
             tunnel_cost_per_m=50.0,
             bridge_cost_per_m=100.0,
@@ -549,9 +551,14 @@ async def generate_route(request: RouteRequest):
             curvatures = []
             structures = []
             
+            # Track line segments (may need multiple if there are gaps)
+            current_line = []
+            all_lines = []
+            prev_seg = None
+            
             for seg in path_segments:
                 lat, lng = local_to_latlon(seg.x, seg.y, origin_lat, origin_lng)
-                coordinates.append([lng, lat])
+                coord = [lng, lat]
                 elevations.append(seg.elevation)
                 curvatures.append(seg.curvature)
                 if seg.structure_type and seg.structure_type != StructureType.NORMAL:
@@ -559,6 +566,34 @@ async def generate_route(request: RouteRequest):
                         "type": seg.structure_type.value,
                         "position": [lng, lat]
                     })
+                
+                # Check for discontinuity (gap larger than 500m suggests separate path sections)
+                if prev_seg is not None:
+                    dx = seg.x - prev_seg.x
+                    dy = seg.y - prev_seg.y
+                    dist = math.sqrt(dx*dx + dy*dy)
+                    if dist > 500:  # 500m gap = likely separate paths from bidirectional search
+                        # Start a new line segment
+                        if len(current_line) >= 2:
+                            all_lines.append(current_line)
+                        current_line = [coord]
+                    else:
+                        current_line.append(coord)
+                else:
+                    current_line.append(coord)
+                
+                prev_seg = seg
+            
+            # Add the last line segment
+            if len(current_line) >= 2:
+                all_lines.append(current_line)
+            
+            # Fallback: if no valid lines but we have segments, use all coordinates
+            if not all_lines and len(path_segments) > 0:
+                for seg in path_segments:
+                    lat, lng = local_to_latlon(seg.x, seg.y, origin_lat, origin_lng)
+                    coordinates.append([lng, lat])
+                all_lines = [coordinates] if len(coordinates) >= 2 else []
             
             total_distance = 0.0
             elevation_gain = 0.0
@@ -571,27 +606,46 @@ async def generate_route(request: RouteRequest):
                 dx = curr.x - prev.x
                 dy = curr.y - prev.y
                 dist = math.sqrt(dx*dx + dy*dy)
-                total_distance += dist
+                
+                # Only count distance for connected segments (not gaps)
+                if dist <= 500:
+                    total_distance += dist
                 
                 elev_diff = curr.elevation - prev.elevation
                 if elev_diff > 0:
                     elevation_gain += elev_diff
                 
-                if dist > 0:
+                if dist > 0 and dist <= 500:
                     slope = abs(elev_diff / dist) * 100
                     max_slope = max(max_slope, slope)
             
+            # Use MultiLineString if there are multiple disconnected paths
+            if len(all_lines) > 1:
+                geometry = {
+                    "type": "MultiLineString",
+                    "coordinates": all_lines
+                }
+            elif len(all_lines) == 1:
+                geometry = {
+                    "type": "LineString",
+                    "coordinates": all_lines[0]
+                }
+            else:
+                # Empty path
+                geometry = {
+                    "type": "LineString",
+                    "coordinates": []
+                }
+            
             geojson = {
                 "type": "Feature",
-                "geometry": {
-                    "type": "LineString",
-                    "coordinates": coordinates
-                },
+                "geometry": geometry,
                 "properties": {
                     "elevations": elevations,
                     "curvatures": curvatures,
                     "structures": structures,
-                    "is_partial": is_partial
+                    "is_partial": is_partial,
+                    "has_gap": len(all_lines) > 1  # Flag for frontend
                 }
             }
             
@@ -622,15 +676,27 @@ async def generate_route(request: RouteRequest):
                 stats["failure_location"] = [failure_lng, failure_lat]
                 stats["failure_segment"] = result.failure_segment
                 stats["best_distance_remaining"] = result.best_distance_remaining
-                print(f"[Kinodynamic] Failure location: ({failure_lat:.6f}, {failure_lng:.6f})")
+                print(f"[Kinodynamic] Forward failure location: ({failure_lat:.6f}, {failure_lng:.6f})")
+            
+            # Add backward failure location if available (for bidirectional search)
+            failure_lat_backward, failure_lng_backward = None, None
+            if result.failure_x_backward is not None and result.failure_y_backward is not None:
+                failure_lat_backward, failure_lng_backward = local_to_latlon(
+                    result.failure_x_backward, result.failure_y_backward, origin_lat, origin_lng
+                )
+                stats["failure_location_backward"] = [failure_lng_backward, failure_lat_backward]
+                print(f"[Kinodynamic] Backward failure location: ({failure_lat_backward:.6f}, {failure_lng_backward:.6f})")
             
             # Build GeoJSON from partial path if any, or create minimal geojson for failure point
             route_geojson = None
             if result.path:
                 geojson, path_stats = build_geojson_and_stats(result.path, is_partial=True)
-                # Add failure marker to the path
+                # Add failure marker to the path (forward)
                 if failure_lat is not None:
                     geojson["properties"]["failure_point"] = [failure_lng, failure_lat]
+                # Add backward failure marker if available
+                if failure_lat_backward is not None:
+                    geojson["properties"]["failure_point_backward"] = [failure_lng_backward, failure_lat_backward]
                 route_geojson = geojson
                 stats.update(path_stats)
             elif failure_lat is not None:

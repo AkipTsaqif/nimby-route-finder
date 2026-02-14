@@ -263,6 +263,11 @@ function App() {
 		loadConfig("minSwitchbackInterval", 50),
 	);
 
+	// Water crossing control
+	const [allowWaterCrossing, setAllowWaterCrossing] = useState(() =>
+		loadConfig("allowWaterCrossing", false),
+	);
+
 	// Auto tunnel/bridge detection
 	const [autoTunnelBridge, setAutoTunnelBridge] = useState(() =>
 		loadConfig("autoTunnelBridge", false),
@@ -330,6 +335,7 @@ function App() {
 			allowSwitchbacks,
 			switchbackPenalty,
 			minSwitchbackInterval,
+			allowWaterCrossing,
 			autoTunnelBridge,
 			maxJumpDistance,
 			elevationTolerance,
@@ -362,6 +368,7 @@ function App() {
 		allowSwitchbacks,
 		switchbackPenalty,
 		minSwitchbackInterval,
+		allowWaterCrossing,
 		autoTunnelBridge,
 		maxJumpDistance,
 		elevationTolerance,
@@ -632,7 +639,7 @@ function App() {
 					downsampling_factor: downsamplingFactor,
 					hard_slope_limit_percent: hardSlopeLimit,
 					padding_factor: paddingFactor,
-					allow_water_crossing: false,
+					allow_water_crossing: allowWaterCrossing,
 					// Switchback control
 					allow_switchbacks: allowSwitchbacks,
 					switchback_penalty: switchbackPenalty,
@@ -713,17 +720,31 @@ function App() {
 		setRouteData(null);
 	};
 
-	// Extract route coordinates for Polyline
-	const routeCoordinates: [number, number][] =
-		routeData?.route_geojson?.geometry?.coordinates?.map(
-			(coord: number[]) => [coord[1], coord[0]] as [number, number],
-		) || [];
+	// Extract route coordinates for Polyline (handles both LineString and MultiLineString)
+	const routeCoordinates: [number, number][][] = (() => {
+		const geometry = routeData?.route_geojson?.geometry;
+		if (!geometry) return [];
+
+		if (geometry.type === "MultiLineString") {
+			// MultiLineString: array of line arrays
+			const coords = geometry.coordinates as number[][][];
+			return coords.map((line) =>
+				line.map((coord) => [coord[1], coord[0]] as [number, number]),
+			);
+		} else {
+			// LineString: single line array - wrap in outer array for consistency
+			const coords = geometry.coordinates as number[][];
+			return [
+				coords.map((coord) => [coord[1], coord[0]] as [number, number]),
+			];
+		}
+	})();
 
 	// Check if this is a partial/failed path
 	const isPartialPath =
 		routeData?.route_geojson?.properties?.is_partial || false;
 
-	// Extract failure point if available
+	// Extract failure point if available (forward search)
 	const failurePoint = routeData?.route_geojson?.properties?.failure_point
 		? ([
 				routeData.route_geojson.properties.failure_point[1],
@@ -733,6 +754,20 @@ function App() {
 			? ([
 					routeData.stats.failure_location[1],
 					routeData.stats.failure_location[0],
+				] as [number, number])
+			: null;
+
+	// Extract backward failure point if available (backward search in bidirectional)
+	const failurePointBackward = routeData?.route_geojson?.properties
+		?.failure_point_backward
+		? ([
+				routeData.route_geojson.properties.failure_point_backward[1],
+				routeData.route_geojson.properties.failure_point_backward[0],
+			] as [number, number])
+		: routeData?.stats?.failure_location_backward
+			? ([
+					routeData.stats.failure_location_backward[1],
+					routeData.stats.failure_location_backward[0],
 				] as [number, number])
 			: null;
 
@@ -1335,6 +1370,52 @@ function App() {
 								</div>
 							</>
 						)}
+
+						{/* Water Crossing */}
+						<h3
+							style={{
+								marginTop: "1rem",
+								marginBottom: "0.5rem",
+								color: "#3498db",
+							}}
+						>
+							🌊 Water Crossing
+						</h3>
+						<div
+							className="control-group"
+							style={{
+								display: "flex",
+								alignItems: "center",
+								gap: "0.5rem",
+							}}
+						>
+							<input
+								type="checkbox"
+								id="allowWaterCrossing"
+								checked={allowWaterCrossing}
+								onChange={(e) =>
+									setAllowWaterCrossing(e.target.checked)
+								}
+								style={{ width: "auto" }}
+							/>
+							<label
+								htmlFor="allowWaterCrossing"
+								style={{ cursor: "pointer" }}
+							>
+								Allow crossing small streams (≤100m)
+							</label>
+						</div>
+						<p
+							style={{
+								fontSize: "0.75rem",
+								color: "#888",
+								margin: "0.25rem 0 0.5rem 0",
+							}}
+						>
+							When enabled, the pathfinder can cross small water
+							bodies (creeks, streams) with a cost penalty. Large
+							rivers still require bridges.
+						</p>
 
 						{/* Auto Tunnel/Bridge Detection */}
 						<h3
@@ -2238,26 +2319,32 @@ function App() {
 					{/* Route polyline - interactive for hover */}
 					{routeCoordinates.length > 0 && (
 						<>
-							<Polyline
-								positions={routeCoordinates}
-								pathOptions={{
-									color: isPartialPath
-										? "#ff6b6b"
-										: "#4ecca3",
-									weight: 6,
-									opacity: 0.9,
-									dashArray: isPartialPath
-										? "10, 5"
-										: undefined,
-								}}
-							/>
-							{!isPartialPath && (
-								<InteractivePolyline
-									positions={routeCoordinates}
-									onHover={handleRouteHover}
-									onMouseLeave={handleRouteMouseLeave}
+							{routeCoordinates.map((lineCoords, lineIndex) => (
+								<Polyline
+									key={`route-line-${lineIndex}`}
+									positions={lineCoords}
+									pathOptions={{
+										color: isPartialPath
+											? lineIndex === 0
+												? "#ff6b6b"
+												: "#ffaa44" // Different colors for forward vs backward
+											: "#4ecca3",
+										weight: 6,
+										opacity: 0.9,
+										dashArray: isPartialPath
+											? "10, 5"
+											: undefined,
+									}}
 								/>
-							)}
+							))}
+							{!isPartialPath &&
+								routeCoordinates.length === 1 && (
+									<InteractivePolyline
+										positions={routeCoordinates[0]}
+										onHover={handleRouteHover}
+										onMouseLeave={handleRouteMouseLeave}
+									/>
+								)}
 						</>
 					)}
 
@@ -2276,7 +2363,7 @@ function App() {
 							<Popup>
 								<div style={{ textAlign: "center" }}>
 									<strong style={{ color: "#e74c3c" }}>
-										❌ Path Failed Here
+										❌ Forward Path Failed Here
 									</strong>
 									<br />
 									{routeData?.stats?.failure_segment !==
@@ -2300,6 +2387,32 @@ function App() {
 											km
 										</span>
 									)}
+								</div>
+							</Popup>
+						</CircleMarker>
+					)}
+
+					{/* Backward failure point marker (for bidirectional search) */}
+					{failurePointBackward && (
+						<CircleMarker
+							center={failurePointBackward}
+							radius={12}
+							pathOptions={{
+								color: "#ff6600",
+								fillColor: "#ffaa44",
+								fillOpacity: 0.8,
+								weight: 3,
+							}}
+						>
+							<Popup>
+								<div style={{ textAlign: "center" }}>
+									<strong style={{ color: "#e67e22" }}>
+										❌ Backward Path Failed Here
+									</strong>
+									<br />
+									<span>
+										Searching from goal toward start
+									</span>
 								</div>
 							</Popup>
 						</CircleMarker>
